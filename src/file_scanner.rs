@@ -54,6 +54,58 @@ pub fn format_size(size: u64) -> String {
     }
 }
 
+/// Format timestamp to human readable date string (YYYY-MM-DD HH:MM)
+pub fn format_date(timestamp: i64) -> String {
+    if timestamp == 0 {
+        return String::from("-");
+    }
+
+    // Calculate date components from Unix timestamp
+    // This is a simplified calculation that works for dates after 1970
+    let secs = timestamp as u64;
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Calculate year, month, day using a simplified algorithm
+    let mut year = 1970;
+    let mut remaining_days = days_since_epoch as i64;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for days in days_in_months.iter() {
+        if remaining_days < *days {
+            break;
+        }
+        remaining_days -= *days;
+        month += 1;
+    }
+
+    let day = remaining_days + 1;
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hours, minutes)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 pub fn scan_folder(path: &Path, recursive: bool) -> Result<Vec<FileInfo>, std::io::Error> {
     let mut files = Vec::new();
 

@@ -53,6 +53,9 @@ struct FileInfo {
 - [x] File delete (context menu)
 - [x] File move to folder (context menu or bulk)
 - [x] Show today only filter (modified today)
+- [x] Background scanning (non-blocking UI)
+- [x] Date Modified column (sortable)
+- [x] Image hover preview (tooltip popup)
 
 ## Documentation
 

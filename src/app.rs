@@ -1,10 +1,19 @@
 use crate::csv_export;
-use crate::file_scanner::{self, format_size, is_today, FileInfo};
+use crate::file_scanner::{self, format_date, format_size, is_today, FileInfo};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+
+/// Data for a loaded image preview
+struct ImagePreviewData {
+    pixels: Vec<u8>,
+    width: usize,
+    height: usize,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SortColumn {
@@ -12,6 +21,7 @@ pub enum SortColumn {
     Extension,
     Size,
     Path,
+    Date,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -48,6 +58,16 @@ pub struct FileListerApp {
     show_delete_confirm: bool,
     /// File paths pending deletion (for confirmation modal)
     pending_delete_paths: Vec<(String, String)>, // (absolute_path, full_name)
+    /// Receiver for background scan results
+    scan_receiver: Option<Receiver<Result<Vec<FileInfo>, String>>>,
+    /// Flag indicating scanning is in progress
+    is_scanning: bool,
+    /// Cache of loaded image textures (absolute_path -> texture)
+    image_cache: HashMap<String, egui::TextureHandle>,
+    /// Receiver for background image loading
+    image_receiver: Option<Receiver<(String, ImagePreviewData)>>,
+    /// Path currently being loaded in background
+    image_loading_path: Option<String>,
 }
 
 impl Default for FileListerApp {
@@ -71,6 +91,11 @@ impl Default for FileListerApp {
             selected_files: HashSet::new(),
             show_delete_confirm: false,
             pending_delete_paths: Vec::new(),
+            scan_receiver: None,
+            is_scanning: false,
+            image_cache: HashMap::new(),
+            image_receiver: None,
+            image_loading_path: None,
         }
     }
 }
@@ -138,20 +163,69 @@ impl FileListerApp {
     fn scan_selected_folder(&mut self) {
         self.error_message = None;
         self.selected_files.clear(); // Clear selections on rescan
+        self.image_cache.clear(); // Clear image cache on rescan
 
         if let Some(folder) = &self.selected_folder {
-            match file_scanner::scan_folder(folder, self.recursive) {
-                Ok(files) => {
-                    self.status_message = format!("Scanned: {} files found", files.len());
-                    self.files = files;
-                    self.sort_files();
-                    self.apply_filter();
+            let folder = folder.clone();
+            let recursive = self.recursive;
+
+            // Create channel for receiving results
+            let (tx, rx) = mpsc::channel();
+            self.scan_receiver = Some(rx);
+            self.is_scanning = true;
+            self.status_message = String::from("Scanning...");
+
+            // Spawn background thread for scanning
+            thread::spawn(move || {
+                let result = file_scanner::scan_folder(&folder, recursive)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+        }
+    }
+
+    /// Check for scan results from background thread
+    fn check_scan_results(&mut self) {
+        if let Some(receiver) = &self.scan_receiver {
+            // Try to receive without blocking
+            if let Ok(result) = receiver.try_recv() {
+                match result {
+                    Ok(files) => {
+                        self.status_message = format!("Scanned: {} files found", files.len());
+                        self.files = files;
+                        self.sort_files();
+                        self.apply_filter();
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Error scanning folder: {}", e));
+                        self.files.clear();
+                        self.filtered_files.clear();
+                    }
                 }
-                Err(e) => {
-                    self.error_message = Some(format!("Error scanning folder: {}", e));
-                    self.files.clear();
-                    self.filtered_files.clear();
-                }
+                self.is_scanning = false;
+                self.scan_receiver = None;
+            }
+        }
+    }
+
+    /// Check for completed background image loads
+    fn check_image_loads(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.image_receiver {
+            // Try to receive without blocking
+            if let Ok((path, data)) = receiver.try_recv() {
+                let size = [data.width, data.height];
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &data.pixels);
+                let texture = ctx.load_texture(
+                    format!("preview_{}", path),
+                    color_image,
+                    egui::TextureOptions::default(),
+                );
+
+                // Store in cache
+                self.image_cache.insert(path.clone(), texture);
+                self.image_loading_path = None;
+                self.image_receiver = None;
+                ctx.request_repaint();
             }
         }
     }
@@ -180,6 +254,12 @@ impl FileListerApp {
             SortColumn::Path => {
                 self.files.sort_by(|a, b| {
                     let cmp = a.relative_path.to_lowercase().cmp(&b.relative_path.to_lowercase());
+                    if order == SortOrder::Descending { cmp.reverse() } else { cmp }
+                });
+            }
+            SortColumn::Date => {
+                self.files.sort_by(|a, b| {
+                    let cmp = a.modified_timestamp.cmp(&b.modified_timestamp);
                     if order == SortOrder::Descending { cmp.reverse() } else { cmp }
                 });
             }
@@ -573,10 +653,94 @@ impl FileListerApp {
         self.pending_delete_paths.clear();
         self.show_delete_confirm = false;
     }
+
+    /// Check if file extension is an image type
+    fn is_image_file(extension: &str) -> bool {
+        let image_extensions = ["jpg", "jpeg", "png", "gif", "bmp", "ico", "webp"];
+        image_extensions.contains(&extension.to_lowercase().as_str())
+    }
+
+    /// Load hover preview for image file in background
+    fn load_hover_preview(&mut self, idx: usize, ctx: &egui::Context) {
+        if idx >= self.filtered_files.len() {
+            return;
+        }
+
+        let file = &self.filtered_files[idx];
+
+        // Only load preview for image files
+        if !Self::is_image_file(&file.extension) {
+            return;
+        }
+
+        let abs_path = file.absolute_path.clone();
+
+        // Already in cache - nothing to do
+        if self.image_cache.contains_key(&abs_path) {
+            return;
+        }
+
+        // Don't start new load if we're already loading this file
+        if self.image_loading_path.as_ref() == Some(&abs_path) {
+            return;
+        }
+
+        // Start background loading
+        let (tx, rx) = mpsc::channel();
+        self.image_receiver = Some(rx);
+        self.image_loading_path = Some(abs_path.clone());
+
+        // Spawn background thread to load and resize image
+        thread::spawn(move || {
+            let path = std::path::Path::new(&abs_path);
+            if let Ok(image_data) = std::fs::read(path) {
+                if let Ok(image) = image::load_from_memory(&image_data) {
+                    // Resize large images for preview (max 400x400)
+                    let max_size = 400u32;
+                    let (width, height) = if image.width() > max_size || image.height() > max_size {
+                        let aspect = image.width() as f32 / image.height() as f32;
+                        if aspect > 1.0 {
+                            (max_size, (max_size as f32 / aspect) as u32)
+                        } else {
+                            ((max_size as f32 * aspect) as u32, max_size)
+                        }
+                    } else {
+                        (image.width(), image.height())
+                    };
+
+                    let resized = image.resize(width, height, image::imageops::FilterType::Triangle);
+                    let image_buffer = resized.to_rgba8();
+                    let pixels = image_buffer.into_raw();
+
+                    let data = ImagePreviewData {
+                        pixels,
+                        width: resized.width() as usize,
+                        height: resized.height() as usize,
+                    };
+
+                    let _ = tx.send((abs_path, data));
+                }
+            }
+        });
+
+        ctx.request_repaint();
+    }
+
 }
 
 impl eframe::App for FileListerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check for background scan results
+        self.check_scan_results();
+
+        // Check for background image load results
+        self.check_image_loads(ctx);
+
+        // Keep repainting while scanning or loading images
+        if self.is_scanning || self.image_receiver.is_some() {
+            ctx.request_repaint();
+        }
+
         // Top panel for controls
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(10.0);
@@ -587,12 +751,14 @@ impl eframe::App for FileListerApp {
 
             // Folder selection section
             ui.horizontal(|ui| {
-                if ui.button("Select Folder...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.selected_folder = Some(folder);
-                        self.scan_selected_folder();
+                ui.add_enabled_ui(!self.is_scanning, |ui| {
+                    if ui.button("Select Folder...").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            self.selected_folder = Some(folder);
+                            self.scan_selected_folder();
+                        }
                     }
-                }
+                });
 
                 if let Some(folder) = &self.selected_folder {
                     ui.label(format!("Selected: {}", folder.display()));
@@ -601,14 +767,22 @@ impl eframe::App for FileListerApp {
 
             ui.add_space(5.0);
 
-            // Recursive checkbox
+            // Recursive checkbox (disabled while scanning)
             ui.horizontal(|ui| {
-                let old_recursive = self.recursive;
-                ui.checkbox(&mut self.recursive, "Include subfolders (recursive)");
+                ui.add_enabled_ui(!self.is_scanning, |ui| {
+                    let old_recursive = self.recursive;
+                    ui.checkbox(&mut self.recursive, "Include subfolders (recursive)");
 
-                // Re-scan if checkbox changed and folder is selected
-                if old_recursive != self.recursive && self.selected_folder.is_some() {
-                    self.scan_selected_folder();
+                    // Re-scan if checkbox changed and folder is selected
+                    if old_recursive != self.recursive && self.selected_folder.is_some() {
+                        self.scan_selected_folder();
+                    }
+                });
+
+                // Show loading spinner while scanning
+                if self.is_scanning {
+                    ui.spinner();
+                    ui.label("Scanning files...");
                 }
             });
 
@@ -730,6 +904,7 @@ impl eframe::App for FileListerApp {
                     .column(Column::initial(150.0).resizable(true).clip(true))  // Name
                     .column(Column::initial(70.0).resizable(true).clip(true))   // Extension
                     .column(Column::initial(80.0).resizable(true).clip(true))   // Size
+                    .column(Column::initial(130.0).resizable(true).clip(true))  // Date Modified
                     .column(Column::initial(200.0).resizable(true).clip(true))  // Path
                     .column(Column::remainder().resizable(true).clip(true))     // Full Path
                     .header(24.0, |mut header| {
@@ -763,6 +938,11 @@ impl eframe::App for FileListerApp {
                             }
                         });
                         header.col(|ui| {
+                            if ui.button(format!("Date{}", self.get_sort_indicator(SortColumn::Date))).clicked() {
+                                self.toggle_sort(SortColumn::Date);
+                            }
+                        });
+                        header.col(|ui| {
                             if ui.button(format!("Path{}", self.get_sort_indicator(SortColumn::Path))).clicked() {
                                 self.toggle_sort(SortColumn::Path);
                             }
@@ -778,6 +958,7 @@ impl eframe::App for FileListerApp {
                             let file_name = self.filtered_files[idx].name.clone();
                             let file_extension = self.filtered_files[idx].extension.clone();
                             let file_size = self.filtered_files[idx].file_size;
+                            let file_modified = self.filtered_files[idx].modified_timestamp;
                             let file_relative_path = self.filtered_files[idx].relative_path.clone();
                             let file_absolute_path = self.filtered_files[idx].absolute_path.clone();
                             let file_path = file_paths[idx].clone();
@@ -793,11 +974,14 @@ impl eframe::App for FileListerApp {
                                 }
                             });
 
-                            // Icon column: file type + duplicate indicator
+                            // Icon column: file type + duplicate indicator + image preview on hover
                             row.col(|ui| {
-                                ui.horizontal(|ui| {
+                                let icon_response = ui.horizontal(|ui| {
                                     // File type icon
-                                    ui.label(Self::get_file_type_icon(&file_extension));
+                                    let icon_label = ui.add(
+                                        egui::Label::new(Self::get_file_type_icon(&file_extension))
+                                            .sense(egui::Sense::hover())
+                                    );
 
                                     // Duplicate indicator
                                     if let Some(count) = dup_count {
@@ -807,7 +991,29 @@ impl eframe::App for FileListerApp {
                                         );
                                         dup_label.on_hover_text(format!("Duplicate: {} files with this name", count));
                                     }
-                                });
+
+                                    icon_label
+                                }).inner;
+
+                                // Show image preview on hover for image files (on icon)
+                                if icon_response.hovered() && Self::is_image_file(&file_extension) {
+                                    // Get cached texture or trigger background load
+                                    if let Some(tex) = self.image_cache.get(&file_absolute_path) {
+                                        // Show from cache immediately
+                                        icon_response.on_hover_ui_at_pointer(|ui| {
+                                            ui.set_max_width(420.0);
+                                            ui.label(egui::RichText::new(&file_name).strong());
+                                            ui.add_space(4.0);
+                                            let size = tex.size();
+                                            ui.image((tex.id(), egui::vec2(size[0] as f32, size[1] as f32)));
+                                        });
+                                    } else {
+                                        // Start loading in background if not already loading this file
+                                        if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                            self.load_hover_preview(idx, ctx);
+                                        }
+                                    }
+                                }
                             });
 
                             // Name column: supports rename via double-click
@@ -845,6 +1051,27 @@ impl eframe::App for FileListerApp {
                                     if label.double_clicked() {
                                         self.start_rename(idx);
                                     }
+
+                                    // Show image preview on hover for image files
+                                    if label.hovered() && Self::is_image_file(&file_extension) {
+                                        // Get cached texture or trigger background load
+                                        if let Some(tex) = self.image_cache.get(&file_absolute_path) {
+                                            // Show from cache immediately
+                                            label.clone().on_hover_ui_at_pointer(|ui| {
+                                                ui.set_max_width(420.0);
+                                                ui.label(egui::RichText::new(&file_name).strong());
+                                                ui.add_space(4.0);
+                                                let size = tex.size();
+                                                ui.image((tex.id(), egui::vec2(size[0] as f32, size[1] as f32)));
+                                            });
+                                        } else {
+                                            // Start loading in background if not already loading this file
+                                            if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                self.load_hover_preview(idx, ctx);
+                                            }
+                                        }
+                                    }
+
                                     label.context_menu(|ui| {
                                         if ui.button("📂 Open file location").clicked() {
                                             Self::open_in_explorer(&file_path);
@@ -891,6 +1118,28 @@ impl eframe::App for FileListerApp {
                             });
                             row.col(|ui| {
                                 let label = ui.label(format_size(file_size));
+                                label.context_menu(|ui| {
+                                    if ui.button("📂 Open file location").clicked() {
+                                        Self::open_in_explorer(&file_path);
+                                        ui.close();
+                                    }
+                                    if ui.button("✏️ Rename").clicked() {
+                                        self.start_rename(idx);
+                                        ui.close();
+                                    }
+                                    if ui.button("📁 Move to folder...").clicked() {
+                                        self.move_file(&file_path);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("🗑️ Delete").clicked() {
+                                        self.delete_file(&file_path);
+                                        ui.close();
+                                    }
+                                });
+                            });
+                            row.col(|ui| {
+                                let label = ui.label(format_date(file_modified));
                                 label.context_menu(|ui| {
                                     if ui.button("📂 Open file location").clicked() {
                                         Self::open_in_explorer(&file_path);
