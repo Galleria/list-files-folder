@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Windows
+*.pdb
+
+# macOS
+.DS_Store
+
+# Environment
+.env
