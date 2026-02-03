@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileInfo {
@@ -10,6 +11,30 @@ pub struct FileInfo {
     pub relative_path: String,
     pub absolute_path: String,
     pub file_size: u64,
+    /// Modification timestamp (seconds since UNIX epoch)
+    pub modified_timestamp: i64,
+}
+
+/// Check if a timestamp (seconds since UNIX epoch) is from today
+pub fn is_today(timestamp: i64) -> bool {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let file_time = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
+    let now = SystemTime::now();
+
+    // Get start of today (midnight)
+    if let Ok(now_duration) = now.duration_since(UNIX_EPOCH) {
+        let now_secs = now_duration.as_secs();
+        // Calculate seconds since midnight (86400 seconds per day)
+        let secs_since_midnight = now_secs % 86400;
+        let today_start = now_secs - secs_since_midnight;
+
+        if let Ok(file_duration) = file_time.duration_since(UNIX_EPOCH) {
+            let file_secs = file_duration.as_secs();
+            return file_secs >= today_start && file_secs < today_start + 86400;
+        }
+    }
+    false
 }
 
 /// Format file size to human readable string
@@ -80,8 +105,16 @@ fn scan_folder_internal(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-            // Get file size
-            let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            // Get file metadata
+            let metadata = entry.metadata().ok();
+            let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+            // Get modification time as timestamp
+            let modified_timestamp = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
 
             files.push(FileInfo {
                 name,
@@ -90,6 +123,7 @@ fn scan_folder_internal(
                 relative_path,
                 absolute_path,
                 file_size,
+                modified_timestamp,
             });
         } else if path.is_dir() && recursive {
             // Recursively scan subdirectories

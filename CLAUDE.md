@@ -51,6 +51,8 @@ struct FileInfo {
 - [x] Cross-platform support (Windows, macOS, Linux)
 - [x] File rename (double-click or context menu)
 - [x] File delete (context menu)
+- [x] File move to folder (context menu or bulk)
+- [x] Show today only filter (modified today)
 
 ## Documentation
 

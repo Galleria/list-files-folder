@@ -1,5 +1,5 @@
 use crate::csv_export;
-use crate::file_scanner::{self, format_size, FileInfo};
+use crate::file_scanner::{self, format_size, is_today, FileInfo};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
@@ -34,6 +34,8 @@ pub struct FileListerApp {
     duplicate_counts: HashMap<String, usize>,
     /// Show only duplicate files
     show_duplicates_only: bool,
+    /// Show only files modified today
+    show_today_only: bool,
     /// Index of file being renamed (in filtered_files)
     editing_index: Option<usize>,
     /// Text buffer for renaming
@@ -62,6 +64,7 @@ impl Default for FileListerApp {
             filter_text: String::new(),
             duplicate_counts: HashMap::new(),
             show_duplicates_only: false,
+            show_today_only: false,
             editing_index: None,
             editing_text: String::new(),
             request_rename_focus: false,
@@ -210,13 +213,23 @@ impl FileListerApp {
         };
 
         // Apply duplicates filter if enabled
-        if self.show_duplicates_only {
-            self.filtered_files = text_filtered
+        let after_duplicates: Vec<FileInfo> = if self.show_duplicates_only {
+            text_filtered
                 .into_iter()
                 .filter(|f| self.is_duplicate(&f.full_name).is_some())
+                .collect()
+        } else {
+            text_filtered
+        };
+
+        // Apply today filter if enabled
+        if self.show_today_only {
+            self.filtered_files = after_duplicates
+                .into_iter()
+                .filter(|f| is_today(f.modified_timestamp))
                 .collect();
         } else {
-            self.filtered_files = text_filtered;
+            self.filtered_files = after_duplicates;
         }
     }
 
@@ -359,6 +372,93 @@ impl FileListerApp {
         }
     }
 
+    fn move_file(&mut self, file_path: &str) {
+        let source = std::path::Path::new(file_path);
+        if let Some(file_name) = source.file_name() {
+            if let Some(dest_folder) = rfd::FileDialog::new()
+                .set_title("Select destination folder")
+                .pick_folder()
+            {
+                let dest_path = dest_folder.join(file_name);
+                match std::fs::rename(source, &dest_path) {
+                    Ok(_) => {
+                        self.status_message = format!("Moved: {} → {}", file_name.to_string_lossy(), dest_folder.display());
+                        self.error_message = None;
+                        self.scan_selected_folder();
+                    }
+                    Err(_) => {
+                        // If rename fails (cross-device), try copy + delete
+                        if let Err(copy_err) = std::fs::copy(source, &dest_path) {
+                            self.error_message = Some(format!("Move failed: {}", copy_err));
+                        } else if let Err(del_err) = std::fs::remove_file(source) {
+                            self.error_message = Some(format!("Move partial: copied but failed to delete source: {}", del_err));
+                            self.scan_selected_folder();
+                        } else {
+                            self.status_message = format!("Moved: {} → {}", file_name.to_string_lossy(), dest_folder.display());
+                            self.error_message = None;
+                            self.scan_selected_folder();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn move_selected_files(&mut self) {
+        if self.selected_files.is_empty() {
+            return;
+        }
+
+        if let Some(dest_folder) = rfd::FileDialog::new()
+            .set_title("Select destination folder")
+            .pick_folder()
+        {
+            let mut moved_count = 0;
+            let mut failed_count = 0;
+            let mut errors: Vec<String> = Vec::new();
+
+            let files_to_move: Vec<(String, String)> = self.selected_files
+                .iter()
+                .filter_map(|&idx| {
+                    self.filtered_files.get(idx).map(|f| {
+                        (f.absolute_path.clone(), f.full_name.clone())
+                    })
+                })
+                .collect();
+
+            for (source_path, file_name) in files_to_move {
+                let source = std::path::Path::new(&source_path);
+                let dest_path = dest_folder.join(&file_name);
+
+                let move_result = std::fs::rename(source, &dest_path)
+                    .or_else(|_| {
+                        // Try copy + delete for cross-device moves
+                        std::fs::copy(source, &dest_path)?;
+                        std::fs::remove_file(source)
+                    });
+
+                match move_result {
+                    Ok(_) => moved_count += 1,
+                    Err(e) => {
+                        failed_count += 1;
+                        errors.push(format!("{}: {}", file_name, e));
+                    }
+                }
+            }
+
+            if failed_count == 0 {
+                self.status_message = format!("Moved {} files to {}", moved_count, dest_folder.display());
+                self.error_message = None;
+            } else {
+                self.status_message = format!("Moved {} files, {} failed", moved_count, failed_count);
+                self.error_message = Some(errors.join("; "));
+            }
+
+            self.selected_files.clear();
+            self.scan_selected_folder();
+        }
+    }
+
     fn rename_file(&mut self, old_path: &str, new_name: &str) {
         let old = std::path::Path::new(old_path);
         if let Some(parent) = old.parent() {
@@ -482,8 +582,8 @@ impl eframe::App for FileListerApp {
             ui.add_space(10.0);
 
             // Title
-            ui.heading("File Lister");
-            ui.add_space(10.0);
+            //ui.heading("File Lister");
+            //ui.add_space(10.0);
 
             // Folder selection section
             ui.horizontal(|ui| {
@@ -574,11 +674,23 @@ impl eframe::App for FileListerApp {
                         self.apply_filter();
                     }
 
+                    ui.add_space(10.0);
+
+                    // Show today only checkbox
+                    let old_show_today = self.show_today_only;
+                    ui.checkbox(&mut self.show_today_only, "Show today only");
+                    if old_show_today != self.show_today_only {
+                        self.apply_filter();
+                    }
+
                     ui.add_space(20.0);
 
-                    // Delete Selected button
+                    // Move Selected and Delete Selected buttons
                     let selected_count = self.selected_files.len();
                     ui.add_enabled_ui(selected_count > 0, |ui| {
+                        if ui.button(format!("Move Selected ({})", selected_count)).clicked() {
+                            self.move_selected_files();
+                        }
                         if ui.button(format!("Delete Selected ({})", selected_count)).clicked() {
                             self.prepare_bulk_delete();
                         }
@@ -742,6 +854,10 @@ impl eframe::App for FileListerApp {
                                             self.start_rename(idx);
                                             ui.close();
                                         }
+                                        if ui.button("📁 Move to folder...").clicked() {
+                                            self.move_file(&file_path);
+                                            ui.close();
+                                        }
                                         ui.separator();
                                         if ui.button("🗑️ Delete").clicked() {
                                             self.delete_file(&file_path);
@@ -762,6 +878,10 @@ impl eframe::App for FileListerApp {
                                         self.start_rename(idx);
                                         ui.close();
                                     }
+                                    if ui.button("📁 Move to folder...").clicked() {
+                                        self.move_file(&file_path);
+                                        ui.close();
+                                    }
                                     ui.separator();
                                     if ui.button("🗑️ Delete").clicked() {
                                         self.delete_file(&file_path);
@@ -778,6 +898,10 @@ impl eframe::App for FileListerApp {
                                     }
                                     if ui.button("✏️ Rename").clicked() {
                                         self.start_rename(idx);
+                                        ui.close();
+                                    }
+                                    if ui.button("📁 Move to folder...").clicked() {
+                                        self.move_file(&file_path);
                                         ui.close();
                                     }
                                     ui.separator();
@@ -798,6 +922,10 @@ impl eframe::App for FileListerApp {
                                         self.start_rename(idx);
                                         ui.close();
                                     }
+                                    if ui.button("📁 Move to folder...").clicked() {
+                                        self.move_file(&file_path);
+                                        ui.close();
+                                    }
                                     ui.separator();
                                     if ui.button("🗑️ Delete").clicked() {
                                         self.delete_file(&file_path);
@@ -814,6 +942,10 @@ impl eframe::App for FileListerApp {
                                     }
                                     if ui.button("✏️ Rename").clicked() {
                                         self.start_rename(idx);
+                                        ui.close();
+                                    }
+                                    if ui.button("📁 Move to folder...").clicked() {
+                                        self.move_file(&file_path);
                                         ui.close();
                                     }
                                     ui.separator();
