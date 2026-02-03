@@ -56,11 +56,15 @@ struct FileInfo {
 - [x] Background scanning (non-blocking UI)
 - [x] Date Modified column (sortable)
 - [x] Image hover preview (tooltip popup)
+- [x] Video hover preview (FFmpeg thumbnail extraction)
+- [x] PDF hover preview (first page, requires Pdfium)
 
 ## Documentation
 
 - [README.md](README.md) - User documentation, installation, usage
 - [SPEC.md](SPEC.md) - Full specification and requirements
+
+**Important**: When adding or updating features, always update SPEC.md to keep documentation in sync with the codebase.
 
 ## CLI Usage
 
@@ -78,3 +82,5 @@ cargo run -- -f "C:\folder" -o "output.csv" -r
 - Filter exports only filtered results
 - Cross-platform font loading (Windows/macOS/Linux)
 - Platform-specific file manager integration
+- Video preview requires FFmpeg (install with: `winget install ffmpeg`)
+- PDF preview requires Pdfium library (pdfium-render crate)

@@ -2,11 +2,24 @@ use crate::csv_export;
 use crate::file_scanner::{self, format_date, format_size, is_today, FileInfo};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use pdfium_render::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Once;
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// Global FFmpeg availability (checked once at startup)
+static FFMPEG_CHECKED: Once = Once::new();
+static FFMPEG_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Global Pdfium availability
+static PDFIUM_CHECKED: Once = Once::new();
+static PDFIUM_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static PDFIUM_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 /// Data for a loaded image preview
 struct ImagePreviewData {
@@ -68,6 +81,8 @@ pub struct FileListerApp {
     image_receiver: Option<Receiver<(String, ImagePreviewData)>>,
     /// Path currently being loaded in background
     image_loading_path: Option<String>,
+    /// When the current image/video loading started (for timeout)
+    image_loading_start: Option<Instant>,
 }
 
 impl Default for FileListerApp {
@@ -96,6 +111,7 @@ impl Default for FileListerApp {
             image_cache: HashMap::new(),
             image_receiver: None,
             image_loading_path: None,
+            image_loading_start: None,
         }
     }
 }
@@ -157,6 +173,12 @@ impl FileListerApp {
 
         cc.egui_ctx.set_fonts(fonts);
 
+        // Check if FFmpeg is available (for video thumbnails)
+        Self::check_ffmpeg_availability();
+
+        // Check if Pdfium is available (for PDF previews)
+        Self::check_pdfium_availability();
+
         Self::default()
     }
 
@@ -210,6 +232,17 @@ impl FileListerApp {
 
     /// Check for completed background image loads
     fn check_image_loads(&mut self, ctx: &egui::Context) {
+        // Check for timeout (10 seconds for video thumbnails)
+        if let Some(start_time) = self.image_loading_start {
+            if start_time.elapsed() > Duration::from_secs(10) {
+                // Timeout - clear loading state
+                self.image_loading_path = None;
+                self.image_receiver = None;
+                self.image_loading_start = None;
+                return;
+            }
+        }
+
         if let Some(receiver) = &self.image_receiver {
             // Try to receive without blocking
             if let Ok((path, data)) = receiver.try_recv() {
@@ -225,9 +258,15 @@ impl FileListerApp {
                 self.image_cache.insert(path.clone(), texture);
                 self.image_loading_path = None;
                 self.image_receiver = None;
+                self.image_loading_start = None;
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// Get elapsed loading time in seconds (for UI display)
+    fn get_loading_elapsed_secs(&self) -> Option<u64> {
+        self.image_loading_start.map(|start| start.elapsed().as_secs())
     }
 
     fn sort_files(&mut self) {
@@ -660,7 +699,23 @@ impl FileListerApp {
         image_extensions.contains(&extension.to_lowercase().as_str())
     }
 
-    /// Load hover preview for image file in background
+    /// Check if file extension is a video type
+    fn is_video_file(extension: &str) -> bool {
+        let video_extensions = ["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "mpeg", "mpg", "3gp"];
+        video_extensions.contains(&extension.to_lowercase().as_str())
+    }
+
+    /// Check if file extension is a PDF
+    fn is_pdf_file(extension: &str) -> bool {
+        extension.to_lowercase() == "pdf"
+    }
+
+    /// Check if file is previewable (image, video, or PDF)
+    fn is_previewable(extension: &str) -> bool {
+        Self::is_image_file(extension) || Self::is_video_file(extension) || Self::is_pdf_file(extension)
+    }
+
+    /// Load hover preview for image/video file in background
     fn load_hover_preview(&mut self, idx: usize, ctx: &egui::Context) {
         if idx >= self.filtered_files.len() {
             return;
@@ -668,12 +723,13 @@ impl FileListerApp {
 
         let file = &self.filtered_files[idx];
 
-        // Only load preview for image files
-        if !Self::is_image_file(&file.extension) {
+        // Only load preview for previewable files (images and videos)
+        if !Self::is_previewable(&file.extension) {
             return;
         }
 
         let abs_path = file.absolute_path.clone();
+        let extension = file.extension.clone();
 
         // Already in cache - nothing to do
         if self.image_cache.contains_key(&abs_path) {
@@ -685,16 +741,48 @@ impl FileListerApp {
             return;
         }
 
+        let is_video = Self::is_video_file(&extension);
+        let is_pdf = Self::is_pdf_file(&extension);
+
+        // Don't try to load video thumbnails if FFmpeg isn't ready
+        if is_video && !Self::is_ffmpeg_ready() {
+            Self::debug_log("[DEBUG] load_hover_preview: Skipping video (FFmpeg not ready)");
+            return;
+        }
+
+        // Don't try to load PDF thumbnails if Pdfium isn't ready
+        if is_pdf && !Self::is_pdfium_ready() {
+            Self::debug_log("[DEBUG] load_hover_preview: Skipping PDF (Pdfium not ready)");
+            return;
+        }
+
         // Start background loading
         let (tx, rx) = mpsc::channel();
         self.image_receiver = Some(rx);
         self.image_loading_path = Some(abs_path.clone());
+        self.image_loading_start = Some(Instant::now());
 
-        // Spawn background thread to load and resize image
+        Self::debug_log(&format!("[DEBUG] load_hover_preview: is_video={}, is_pdf={}, path={}", is_video, is_pdf, abs_path));
+
+        // Spawn background thread to load and resize image/video/PDF thumbnail
         thread::spawn(move || {
-            let path = std::path::Path::new(&abs_path);
-            if let Ok(image_data) = std::fs::read(path) {
-                if let Ok(image) = image::load_from_memory(&image_data) {
+            Self::debug_log(&format!("[DEBUG] Thread started for: {}", abs_path));
+            let image_data = if is_video {
+                // Extract thumbnail from video using FFmpeg
+                Self::debug_log("[DEBUG] Calling extract_video_thumbnail...");
+                Self::extract_video_thumbnail(&abs_path)
+            } else if is_pdf {
+                // Extract first page from PDF
+                Self::debug_log("[DEBUG] Calling extract_pdf_thumbnail...");
+                Self::extract_pdf_thumbnail(&abs_path)
+            } else {
+                // Load image directly
+                std::fs::read(&abs_path).ok()
+            };
+            Self::debug_log(&format!("[DEBUG] image_data result: {:?}", image_data.as_ref().map(|d| d.len())));
+
+            if let Some(data) = image_data {
+                if let Ok(image) = image::load_from_memory(&data) {
                     // Resize large images for preview (max 400x400)
                     let max_size = 400u32;
                     let (width, height) = if image.width() > max_size || image.height() > max_size {
@@ -712,18 +800,362 @@ impl FileListerApp {
                     let image_buffer = resized.to_rgba8();
                     let pixels = image_buffer.into_raw();
 
-                    let data = ImagePreviewData {
+                    let preview_data = ImagePreviewData {
                         pixels,
                         width: resized.width() as usize,
                         height: resized.height() as usize,
                     };
 
-                    let _ = tx.send((abs_path, data));
+                    let _ = tx.send((abs_path, preview_data));
                 }
             }
         });
 
         ctx.request_repaint();
+    }
+
+    /// Check for FFmpeg at startup (only runs once)
+    fn check_ffmpeg_availability() {
+        FFMPEG_CHECKED.call_once(|| {
+            // Check if FFmpeg exists in system PATH
+            if let Ok(output) = Command::new("where").arg("ffmpeg").output() {
+                if output.status.success() {
+                    let path_str = String::from_utf8_lossy(&output.stdout);
+                    if path_str.lines().next().is_some() {
+                        Self::debug_log("[DEBUG] FFmpeg found in system PATH");
+                        FFMPEG_AVAILABLE.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+            Self::debug_log("[DEBUG] FFmpeg not found - video thumbnails disabled");
+            Self::debug_log("[DEBUG] Install FFmpeg with: winget install ffmpeg");
+        });
+    }
+
+    /// Check if FFmpeg is available
+    fn is_ffmpeg_ready() -> bool {
+        FFMPEG_AVAILABLE.load(Ordering::SeqCst)
+    }
+
+    /// Check if FFmpeg is currently downloading (no longer used, kept for compatibility)
+    fn is_ffmpeg_downloading() -> bool {
+        false
+    }
+
+    /// Get the path where Pdfium library should be stored
+    fn get_pdfium_path() -> PathBuf {
+        // Store in user's app data directory
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| std::env::temp_dir());
+        base.join("file-lister").join("pdfium")
+    }
+
+    /// Check for Pdfium at startup (only runs once), download if needed
+    fn check_pdfium_availability() {
+        PDFIUM_CHECKED.call_once(|| {
+            // Try to bind to system Pdfium first
+            if Pdfium::bind_to_system_library().is_ok() {
+                Self::debug_log("[DEBUG] Pdfium library found in system");
+                PDFIUM_AVAILABLE.store(true, Ordering::SeqCst);
+                return;
+            }
+
+            // Try to bind to downloaded Pdfium
+            let pdfium_dir = Self::get_pdfium_path();
+            if let Ok(bindings) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&pdfium_dir)) {
+                Self::debug_log(&format!("[DEBUG] Pdfium library found at {:?}", pdfium_dir));
+                PDFIUM_AVAILABLE.store(true, Ordering::SeqCst);
+                return;
+            }
+
+            Self::debug_log("[DEBUG] Pdfium not found - starting background download...");
+
+            // Start background download
+            thread::spawn(|| {
+                Self::download_pdfium();
+            });
+        });
+    }
+
+    /// Download Pdfium library in background
+    fn download_pdfium() {
+        use std::io::{Read, Write};
+
+        PDFIUM_DOWNLOADING.store(true, Ordering::SeqCst);
+        let pdfium_dir = Self::get_pdfium_path();
+
+        // Create directory if it doesn't exist
+        if let Err(e) = std::fs::create_dir_all(&pdfium_dir) {
+            Self::debug_log(&format!("[ERROR] Failed to create Pdfium directory: {}", e));
+            PDFIUM_DOWNLOADING.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        Self::debug_log(&format!("[DEBUG] Downloading Pdfium to {:?}...", pdfium_dir));
+
+        // Download URL for Pdfium - using bblanchon/pdfium-binaries (verified working)
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        let download_url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7665/pdfium-win-x64.tgz";
+        #[cfg(all(target_os = "windows", target_arch = "x86"))]
+        let download_url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7665/pdfium-win-x86.tgz";
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        let download_url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7665/pdfium-mac-x64.tgz";
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let download_url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7665/pdfium-mac-arm64.tgz";
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let download_url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7665/pdfium-linux-x64.tgz";
+
+        match Self::download_and_extract_pdfium(download_url, &pdfium_dir) {
+            Ok(_) => {
+                Self::debug_log("[DEBUG] Pdfium download completed");
+                // Try to bind to verify it works
+                if Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&pdfium_dir)).is_ok() {
+                    PDFIUM_AVAILABLE.store(true, Ordering::SeqCst);
+                    Self::debug_log("[DEBUG] Pdfium is now ready");
+                } else {
+                    Self::debug_log("[ERROR] Failed to bind to downloaded Pdfium");
+                }
+            }
+            Err(e) => {
+                Self::debug_log(&format!("[ERROR] Failed to download Pdfium: {}", e));
+            }
+        }
+        PDFIUM_DOWNLOADING.store(false, Ordering::SeqCst);
+    }
+
+    /// Download and extract Pdfium from URL
+    fn download_and_extract_pdfium(url: &str, dest_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        use tar::Archive;
+
+        Self::debug_log(&format!("[DEBUG] Downloading from {}", url));
+
+        // Download the .tgz file
+        let response = ureq::get(url).call()?;
+        let mut bytes = Vec::new();
+        response.into_reader().read_to_end(&mut bytes)?;
+
+        Self::debug_log(&format!("[DEBUG] Downloaded {} bytes", bytes.len()));
+
+        // Library name based on platform
+        #[cfg(target_os = "windows")]
+        let lib_name = "pdfium.dll";
+        #[cfg(target_os = "macos")]
+        let lib_name = "libpdfium.dylib";
+        #[cfg(target_os = "linux")]
+        let lib_name = "libpdfium.so";
+
+        // Extract the .tgz file
+        let cursor = std::io::Cursor::new(bytes);
+        let gz = GzDecoder::new(cursor);
+        let mut archive = Archive::new(gz);
+
+        let mut found_lib = false;
+
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?;
+            let path_str = path.to_string_lossy().to_string();
+
+            // Extract the main library file directly to dest_dir
+            if path_str.ends_with(lib_name) {
+                let outpath = dest_dir.join(lib_name);
+                Self::debug_log(&format!("[DEBUG] Extracting {} to {:?}", path_str, outpath));
+                let mut outfile = std::fs::File::create(&outpath)?;
+                std::io::copy(&mut entry, &mut outfile)?;
+                found_lib = true;
+                break;
+            }
+        }
+
+        if !found_lib {
+            return Err(format!("Could not find {} in archive", lib_name).into());
+        }
+
+        Self::debug_log("[DEBUG] Extraction completed");
+        Ok(())
+    }
+
+    /// Check if Pdfium is available for PDF rendering
+    fn is_pdfium_ready() -> bool {
+        PDFIUM_AVAILABLE.load(Ordering::SeqCst)
+    }
+
+    /// Check if Pdfium is currently downloading
+    fn is_pdfium_downloading() -> bool {
+        PDFIUM_DOWNLOADING.load(Ordering::SeqCst)
+    }
+
+    /// Extract first page from PDF as image
+    fn extract_pdf_thumbnail(pdf_path: &str) -> Option<Vec<u8>> {
+        if !Self::is_pdfium_ready() {
+            Self::debug_log("[DEBUG] extract_pdf_thumbnail: Pdfium not ready");
+            return None;
+        }
+
+        Self::debug_log(&format!("[DEBUG] Extracting PDF thumbnail: {}", pdf_path));
+
+        // Try system library first, then downloaded library
+        let bindings = Pdfium::bind_to_system_library()
+            .or_else(|_| {
+                let pdfium_dir = Self::get_pdfium_path();
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&pdfium_dir))
+            })
+            .ok()?;
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_file(pdf_path, None).ok()?;
+
+        if document.pages().len() == 0 {
+            Self::debug_log("[DEBUG] PDF has no pages");
+            return None;
+        }
+
+        let page = document.pages().get(0).ok()?;
+
+        // Render at reasonable size for preview (max 400px width)
+        let page_width: f32 = page.width().value;
+        let page_height: f32 = page.height().value;
+        let scale: f32 = (400.0_f32 / page_width).min(1.0);
+        let width = (page_width * scale) as i32;
+        let height = (page_height * scale) as i32;
+
+        let bitmap = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .set_target_width(width)
+                    .set_target_height(height)
+            )
+            .ok()?;
+
+        // Convert to PNG bytes
+        let image = bitmap.as_image();
+        let mut png_bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        image.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+
+        Self::debug_log(&format!("[DEBUG] PDF thumbnail extracted: {} bytes", png_bytes.len()));
+        Some(png_bytes)
+    }
+
+    /// Write debug log to file (for debugging on Windows GUI)
+    fn debug_log(msg: &str) {
+        use std::io::Write;
+        let log_path = std::env::temp_dir().join("file_lister_debug.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "{}", msg);
+        }
+    }
+
+    /// Find FFmpeg executable in system PATH
+    fn find_ffmpeg() -> Option<PathBuf> {
+        if let Ok(output) = Command::new("where").arg("ffmpeg").output() {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = path_str.lines().next() {
+                    let path = PathBuf::from(first_line.trim());
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract a thumbnail frame from a video file using FFmpeg (auto-downloads if needed)
+    fn extract_video_thumbnail(video_path: &str) -> Option<Vec<u8>> {
+        // Check if FFmpeg is ready
+        if !Self::is_ffmpeg_ready() {
+            Self::debug_log("[DEBUG] extract_video_thumbnail: FFmpeg not ready yet");
+            return None;
+        }
+
+        let ffmpeg = match Self::find_ffmpeg() {
+            Some(path) => path,
+            None => {
+                Self::debug_log("[DEBUG] extract_video_thumbnail: FFmpeg not found");
+                return None;
+            }
+        };
+        Self::debug_log(&format!("[DEBUG] Using FFmpeg: {:?}", ffmpeg));
+        Self::debug_log(&format!("[DEBUG] Video path: {}", video_path));
+
+        // Use a temp file instead of pipe (more reliable on Windows)
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("thumb_{}.png", std::process::id()));
+        let temp_path = temp_file.to_string_lossy().to_string();
+
+        // Try to extract a frame at 1 second
+        let result = Command::new(&ffmpeg)
+            .args([
+                "-i", video_path,
+                "-ss", "00:00:01",
+                "-vframes", "1",
+                "-vcodec", "png",
+                "-y",
+                &temp_path
+            ])
+            .output();
+
+        match result {
+            Ok(output) => {
+                Self::debug_log(&format!("[DEBUG] FFmpeg exit status: {:?}", output.status));
+                if !output.stderr.is_empty() {
+                    Self::debug_log(&format!("[DEBUG] FFmpeg stderr: {}", String::from_utf8_lossy(&output.stderr)));
+                }
+
+                if output.status.success() {
+                    // Read the temp file
+                    if let Ok(data) = std::fs::read(&temp_file) {
+                        let _ = std::fs::remove_file(&temp_file);
+                        if !data.is_empty() {
+                            Self::debug_log(&format!("[DEBUG] Thumbnail extracted: {} bytes", data.len()));
+                            return Some(data);
+                        }
+                    }
+                }
+
+                // Try at 0 seconds if 1 second failed
+                Self::debug_log("[DEBUG] Trying at 0 seconds...");
+                let result2 = Command::new(&ffmpeg)
+                    .args([
+                        "-i", video_path,
+                        "-ss", "00:00:00",
+                        "-vframes", "1",
+                        "-vcodec", "png",
+                        "-y",
+                        &temp_path
+                    ])
+                    .output();
+
+                if let Ok(output2) = result2 {
+                    Self::debug_log(&format!("[DEBUG] FFmpeg (0s) exit status: {:?}", output2.status));
+                    if output2.status.success() {
+                        if let Ok(data) = std::fs::read(&temp_file) {
+                            let _ = std::fs::remove_file(&temp_file);
+                            if !data.is_empty() {
+                                Self::debug_log(&format!("[DEBUG] Thumbnail extracted at 0s: {} bytes", data.len()));
+                                return Some(data);
+                            }
+                        }
+                    }
+                }
+
+                let _ = std::fs::remove_file(&temp_file);
+                Self::debug_log("[ERROR] Failed to extract thumbnail");
+                None
+            }
+            Err(e) => {
+                Self::debug_log(&format!("[ERROR] Failed to run FFmpeg: {}", e));
+                None
+            }
+        }
     }
 
 }
@@ -799,7 +1231,7 @@ impl eframe::App for FileListerApp {
             ui.add_space(5.0);
         });
 
-        // Bottom panel for export button (fixed footer)
+        // Bottom panel for export button and tools (fixed footer)
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -816,6 +1248,42 @@ impl eframe::App for FileListerApp {
 
                     ui.label(format!("  |  Showing {} of {} files", self.filtered_files.len(), self.files.len()));
                 }
+
+                // Spacer to push download buttons to the right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Pdfium download button
+                    if Self::is_pdfium_ready() {
+                        ui.colored_label(egui::Color32::GREEN, "✓ PDF");
+                    } else if Self::is_pdfium_downloading() {
+                        ui.spinner();
+                        ui.label("Downloading Pdfium...");
+                        ctx.request_repaint(); // Keep updating while downloading
+                    } else {
+                        if ui.button("📥 Download Pdfium").clicked() {
+                            // Set downloading flag BEFORE spawning thread to avoid race condition
+                            PDFIUM_DOWNLOADING.store(true, Ordering::SeqCst);
+                            thread::spawn(|| {
+                                Self::download_pdfium();
+                            });
+                        }
+                    }
+
+                    ui.separator();
+
+                    // FFmpeg status/install button
+                    if Self::is_ffmpeg_ready() {
+                        ui.colored_label(egui::Color32::GREEN, "✓ Video");
+                    } else {
+                        if ui.button("📥 Install FFmpeg").clicked() {
+                            // Open FFmpeg download page
+                            let _ = open::that("https://www.gyan.dev/ffmpeg/builds/");
+                        }
+                        ui.label("⚠").on_hover_text("FFmpeg not found.\nClick to download, or run:\nwinget install ffmpeg");
+                    }
+
+                    ui.separator();
+                    ui.label("Preview Tools:");
+                });
             });
             ui.add_space(10.0);
         });
@@ -974,7 +1442,7 @@ impl eframe::App for FileListerApp {
                                 }
                             });
 
-                            // Icon column: file type + duplicate indicator + image preview on hover
+                            // Icon column: file type + duplicate indicator + preview on hover
                             row.col(|ui| {
                                 let icon_response = ui.horizontal(|ui| {
                                     // File type icon
@@ -995,22 +1463,74 @@ impl eframe::App for FileListerApp {
                                     icon_label
                                 }).inner;
 
-                                // Show image preview on hover for image files (on icon)
-                                if icon_response.hovered() && Self::is_image_file(&file_extension) {
+                                // Show preview on hover for image/video/PDF files (on icon)
+                                if icon_response.hovered() && Self::is_previewable(&file_extension) {
+                                    let is_video = Self::is_video_file(&file_extension);
+                                    let is_pdf = Self::is_pdf_file(&file_extension);
                                     // Get cached texture or trigger background load
                                     if let Some(tex) = self.image_cache.get(&file_absolute_path) {
                                         // Show from cache immediately
                                         icon_response.on_hover_ui_at_pointer(|ui| {
                                             ui.set_max_width(420.0);
-                                            ui.label(egui::RichText::new(&file_name).strong());
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(&file_name).strong());
+                                                if is_video {
+                                                    ui.label(egui::RichText::new(" 🎬").color(egui::Color32::GRAY));
+                                                } else if is_pdf {
+                                                    ui.label(egui::RichText::new(" 📄").color(egui::Color32::GRAY));
+                                                }
+                                            });
                                             ui.add_space(4.0);
                                             let size = tex.size();
                                             ui.image((tex.id(), egui::vec2(size[0] as f32, size[1] as f32)));
                                         });
                                     } else {
-                                        // Start loading in background if not already loading this file
-                                        if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
-                                            self.load_hover_preview(idx, ctx);
+                                        // Show status for videos
+                                        if is_video {
+                                            if !Self::is_ffmpeg_ready() {
+                                                icon_response.on_hover_text("📹 Video preview requires FFmpeg\nInstall: winget install ffmpeg");
+                                            } else {
+                                                // Start loading in background if not already loading this file
+                                                if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                    self.load_hover_preview(idx, ctx);
+                                                }
+                                                let elapsed = self.get_loading_elapsed_secs().unwrap_or(0);
+                                                let status = if elapsed > 0 {
+                                                    format!("Loading video thumbnail... {}s", elapsed)
+                                                } else {
+                                                    "Loading video thumbnail...".to_string()
+                                                };
+                                                icon_response.on_hover_text(status);
+                                                ctx.request_repaint();
+                                            }
+                                        } else if is_pdf {
+                                            // Show status for PDFs
+                                            if !Self::is_pdfium_ready() {
+                                                if Self::is_pdfium_downloading() {
+                                                    icon_response.on_hover_text("⏳ Downloading Pdfium (first time setup)...");
+                                                    ctx.request_repaint();
+                                                } else {
+                                                    icon_response.on_hover_text("📄 PDF preview - Pdfium not available");
+                                                }
+                                            } else {
+                                                // Start loading in background if not already loading this file
+                                                if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                    self.load_hover_preview(idx, ctx);
+                                                }
+                                                let elapsed = self.get_loading_elapsed_secs().unwrap_or(0);
+                                                let status = if elapsed > 0 {
+                                                    format!("Loading PDF preview... {}s", elapsed)
+                                                } else {
+                                                    "Loading PDF preview...".to_string()
+                                                };
+                                                icon_response.on_hover_text(status);
+                                                ctx.request_repaint();
+                                            }
+                                        } else {
+                                            // Start loading in background if not already loading this file
+                                            if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                self.load_hover_preview(idx, ctx);
+                                            }
                                         }
                                     }
                                 }
@@ -1052,22 +1572,74 @@ impl eframe::App for FileListerApp {
                                         self.start_rename(idx);
                                     }
 
-                                    // Show image preview on hover for image files
-                                    if label.hovered() && Self::is_image_file(&file_extension) {
+                                    // Show preview on hover for image/video/PDF files
+                                    if label.hovered() && Self::is_previewable(&file_extension) {
+                                        let is_video = Self::is_video_file(&file_extension);
+                                        let is_pdf = Self::is_pdf_file(&file_extension);
                                         // Get cached texture or trigger background load
                                         if let Some(tex) = self.image_cache.get(&file_absolute_path) {
                                             // Show from cache immediately
                                             label.clone().on_hover_ui_at_pointer(|ui| {
                                                 ui.set_max_width(420.0);
-                                                ui.label(egui::RichText::new(&file_name).strong());
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new(&file_name).strong());
+                                                    if is_video {
+                                                        ui.label(egui::RichText::new(" 🎬").color(egui::Color32::GRAY));
+                                                    } else if is_pdf {
+                                                        ui.label(egui::RichText::new(" 📄").color(egui::Color32::GRAY));
+                                                    }
+                                                });
                                                 ui.add_space(4.0);
                                                 let size = tex.size();
                                                 ui.image((tex.id(), egui::vec2(size[0] as f32, size[1] as f32)));
                                             });
                                         } else {
-                                            // Start loading in background if not already loading this file
-                                            if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
-                                                self.load_hover_preview(idx, ctx);
+                                            // Show status for videos
+                                            if is_video {
+                                                if !Self::is_ffmpeg_ready() {
+                                                    label.clone().on_hover_text("📹 Video preview requires FFmpeg\nInstall: winget install ffmpeg");
+                                                } else {
+                                                    // Start loading in background if not already loading this file
+                                                    if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                        self.load_hover_preview(idx, ctx);
+                                                    }
+                                                    let elapsed = self.get_loading_elapsed_secs().unwrap_or(0);
+                                                    let status = if elapsed > 0 {
+                                                        format!("Loading video thumbnail... {}s", elapsed)
+                                                    } else {
+                                                        "Loading video thumbnail...".to_string()
+                                                    };
+                                                    label.clone().on_hover_text(status);
+                                                    ctx.request_repaint();
+                                                }
+                                            } else if is_pdf {
+                                                // Show status for PDFs
+                                                if !Self::is_pdfium_ready() {
+                                                    if Self::is_pdfium_downloading() {
+                                                        label.clone().on_hover_text("⏳ Downloading Pdfium (first time setup)...");
+                                                        ctx.request_repaint();
+                                                    } else {
+                                                        label.clone().on_hover_text("📄 PDF preview - Pdfium not available");
+                                                    }
+                                                } else {
+                                                    // Start loading in background if not already loading this file
+                                                    if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                        self.load_hover_preview(idx, ctx);
+                                                    }
+                                                    let elapsed = self.get_loading_elapsed_secs().unwrap_or(0);
+                                                    let status = if elapsed > 0 {
+                                                        format!("Loading PDF preview... {}s", elapsed)
+                                                    } else {
+                                                        "Loading PDF preview...".to_string()
+                                                    };
+                                                    label.clone().on_hover_text(status);
+                                                    ctx.request_repaint();
+                                                }
+                                            } else {
+                                                // Start loading in background if not already loading this file
+                                                if self.image_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                    self.load_hover_preview(idx, ctx);
+                                                }
                                             }
                                         }
                                     }
@@ -1222,6 +1794,7 @@ impl eframe::App for FileListerApp {
             egui::Area::new(egui::Id::new("modal_overlay"))
                 .fixed_pos(egui::Pos2::ZERO)
                 .show(ctx, |ui| {
+                    #[allow(deprecated)]
                     let screen_rect = ctx.screen_rect();
                     ui.painter().rect_filled(
                         screen_rect,
