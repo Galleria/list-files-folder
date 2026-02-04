@@ -22,6 +22,7 @@ dotext = "0.1"
 calamine = "0.26"
 encoding_rs = "0.8"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "ogg", "flac", "wav"] }
+rodio = "0.19"
 
 # Windows: hide console window in release builds
 [profile.release]

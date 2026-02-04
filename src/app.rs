@@ -4,6 +4,7 @@ use crate::file_scanner::{self, format_date, format_size, is_today, FileInfo};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use pdfium_render::prelude::*;
+use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
@@ -118,6 +119,21 @@ pub struct FileListerApp {
     document_receiver: Option<Receiver<(String, DocumentPreviewContent)>>,
     /// Path currently being loaded for document preview
     document_loading_path: Option<String>,
+    /// Audio output stream (must be kept alive for playback)
+    #[allow(dead_code)]
+    audio_stream: Option<(OutputStream, OutputStreamHandle)>,
+    /// Audio sink for controlling playback
+    audio_sink: Option<Sink>,
+    /// Path of currently playing audio file
+    audio_playing_path: Option<String>,
+    /// Flag to track if audio hover is active this frame
+    audio_hover_active: bool,
+    /// Path of audio file that failed to play (for error indication)
+    audio_error_path: Option<String>,
+    /// Path of audio file currently being loaded in background
+    audio_loading_path: Option<String>,
+    /// Receiver for background audio loading results (path, samples, sample_rate, channels, duration_secs)
+    audio_receiver: Option<Receiver<(String, Option<(Vec<i16>, u32, u16)>, Option<f64>)>>,
 }
 
 impl Default for FileListerApp {
@@ -150,6 +166,13 @@ impl Default for FileListerApp {
             document_cache: HashMap::new(),
             document_receiver: None,
             document_loading_path: None,
+            audio_stream: None,
+            audio_sink: None,
+            audio_playing_path: None,
+            audio_hover_active: false,
+            audio_error_path: None,
+            audio_loading_path: None,
+            audio_receiver: None,
         }
     }
 }
@@ -217,7 +240,12 @@ impl FileListerApp {
         // Check if Pdfium is available (for PDF previews)
         Self::check_pdfium_availability();
 
-        Self::default()
+        // Pre-initialize audio stream for faster playback on first hover
+        let audio_stream = OutputStream::try_default().ok();
+
+        let mut app = Self::default();
+        app.audio_stream = audio_stream;
+        app
     }
 
     fn scan_all_folders(&mut self) {
@@ -789,6 +817,155 @@ impl FileListerApp {
         )
     }
 
+    /// Stop audio preview playback
+    fn stop_audio_preview(&mut self) {
+        self.audio_error_path = None; // Clear error when stopping
+        self.audio_loading_path = None; // Cancel any pending load
+        self.audio_receiver = None;
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
+        self.audio_playing_path = None;
+    }
+
+    /// Load audio file in background (non-blocking)
+    fn load_audio_in_background(&mut self, path: &str, duration_secs: Option<f64>) {
+        let path_string = path.to_string();
+
+        // Don't restart if already playing this file
+        if self.audio_playing_path.as_ref() == Some(&path_string) {
+            return;
+        }
+
+        // Don't retry if this file already failed
+        if self.audio_error_path.as_ref() == Some(&path_string) {
+            return;
+        }
+
+        // Don't reload if already loading this file
+        if self.audio_loading_path.as_ref() == Some(&path_string) {
+            return;
+        }
+
+        // Stop any existing playback
+        self.stop_audio_preview();
+
+        // Mark as loading
+        self.audio_loading_path = Some(path_string.clone());
+
+        // Start background loading and decoding
+        let (tx, rx) = mpsc::channel();
+        self.audio_receiver = Some(rx);
+
+        let path_clone = path_string.clone();
+        thread::spawn(move || {
+            // Read and decode audio in background (both are slow operations)
+            let result = (|| -> Option<(Vec<i16>, u32, u16)> {
+                let file = std::fs::File::open(&path_clone).ok()?;
+                let reader = std::io::BufReader::new(file);
+                let decoder = Decoder::new(reader).ok()?;
+
+                let sample_rate = decoder.sample_rate();
+                let channels = decoder.channels();
+
+                // Collect samples (limit to ~30 seconds at 44100Hz stereo to prevent memory issues)
+                let max_samples = 44100 * 2 * 30; // ~30 seconds
+                let samples: Vec<i16> = decoder.take(max_samples).collect();
+
+                if samples.is_empty() {
+                    return None;
+                }
+
+                Some((samples, sample_rate, channels))
+            })();
+
+            let _ = tx.send((path_clone, result, duration_secs));
+        });
+    }
+
+    /// Check for completed audio loading and start playback
+    fn check_audio_loads(&mut self) {
+        if let Some(receiver) = &self.audio_receiver {
+            if let Ok((path, decoded_result, duration_secs)) = receiver.try_recv() {
+                self.audio_loading_path = None;
+                self.audio_receiver = None;
+
+                match decoded_result {
+                    Some((samples, sample_rate, channels)) => {
+                        // Play from pre-decoded samples
+                        self.play_audio_from_samples(&path, samples, sample_rate, channels, duration_secs);
+                    }
+                    None => {
+                        // Decoding failed
+                        self.audio_error_path = Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Play audio from pre-decoded samples (fast, runs on main thread)
+    fn play_audio_from_samples(&mut self, path: &str, samples: Vec<i16>, sample_rate: u32, channels: u16, _duration_secs: Option<f64>) {
+        let path_string = path.to_string();
+
+        // Initialize audio stream if not already done
+        if self.audio_stream.is_none() {
+            match OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_stream = Some((stream, handle));
+                }
+                Err(_) => {
+                    self.audio_error_path = Some(path_string);
+                    return;
+                }
+            }
+        }
+
+        // Get the stream handle
+        let handle = match &self.audio_stream {
+            Some((_, h)) => h,
+            None => {
+                self.audio_error_path = Some(path_string);
+                return;
+            }
+        };
+
+        // Calculate actual buffered duration (not original file duration)
+        let buffered_duration_secs = if sample_rate > 0 && channels > 0 {
+            samples.len() as f64 / (sample_rate as f64 * channels as f64)
+        } else {
+            0.0
+        };
+
+        // Create source from pre-decoded samples (fast - no decoding needed)
+        let source = SamplesBuffer::new(channels, sample_rate, samples);
+
+        // Create sink and set volume to 50%
+        let sink = match Sink::try_new(handle) {
+            Ok(s) => s,
+            Err(_) => {
+                self.audio_error_path = Some(path_string);
+                return;
+            }
+        };
+        sink.set_volume(0.5); // 50% volume
+
+        // Skip to 50% of BUFFERED duration (not original file duration)
+        // This ensures we don't skip past the end of our samples
+        if buffered_duration_secs > 2.0 {
+            let skip_secs = (buffered_duration_secs / 2.0) as u64;
+            let source = source.skip_duration(Duration::from_secs(skip_secs));
+            sink.append(source);
+        } else {
+            // For very short clips, play from the start
+            sink.append(source);
+        }
+
+        sink.play();
+        self.audio_sink = Some(sink);
+        self.audio_playing_path = Some(path_string);
+    }
+
     /// Load document preview in background for hover
     fn load_document_preview(&mut self, idx: usize, ctx: &egui::Context) {
         if idx >= self.filtered_files.len() {
@@ -1352,6 +1529,9 @@ impl FileListerApp {
 
 impl eframe::App for FileListerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Reset audio hover flag at start of frame
+        self.audio_hover_active = false;
+
         // Check for background scan results
         self.check_scan_results();
 
@@ -1361,8 +1541,11 @@ impl eframe::App for FileListerApp {
         // Check for background document load results
         self.check_document_loads();
 
-        // Keep repainting while scanning or loading images/documents
-        if self.is_scanning || self.image_receiver.is_some() || self.document_receiver.is_some() {
+        // Check for background audio load results
+        self.check_audio_loads();
+
+        // Keep repainting while scanning or loading images/documents/audio
+        if self.is_scanning || self.image_receiver.is_some() || self.document_receiver.is_some() || self.audio_receiver.is_some() {
             ctx.request_repaint();
         }
 
@@ -1691,6 +1874,42 @@ impl eframe::App for FileListerApp {
                                     let is_code = Self::is_code_file(&file_extension);
 
                                     if is_document || is_audio || is_code {
+                                        // Start audio playback immediately when hovering on audio file
+                                        if is_audio {
+                                            self.audio_hover_active = true;
+                                            // Try to get duration from cache, otherwise play without seeking
+                                            let duration_secs = self.document_cache.get(&file_absolute_path)
+                                                .and_then(|content| {
+                                                    if let DocumentPreviewContent::Audio { duration, .. } = content {
+                                                        duration.as_ref().and_then(|d| {
+                                                            let parts: Vec<&str> = d.split(':').collect();
+                                                            match parts.len() {
+                                                                2 => {
+                                                                    let mins: f64 = parts[0].parse().ok()?;
+                                                                    let secs: f64 = parts[1].parse().ok()?;
+                                                                    Some(mins * 60.0 + secs)
+                                                                }
+                                                                3 => {
+                                                                    let hrs: f64 = parts[0].parse().ok()?;
+                                                                    let mins: f64 = parts[1].parse().ok()?;
+                                                                    let secs: f64 = parts[2].parse().ok()?;
+                                                                    Some(hrs * 3600.0 + mins * 60.0 + secs)
+                                                                }
+                                                                _ => None,
+                                                            }
+                                                        })
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+                                            // Start background audio loading (non-blocking)
+                                            self.load_audio_in_background(&file_absolute_path, duration_secs);
+                                        }
+                                        // Check if this audio file is currently playing, loading, or has error
+                                        let is_audio_playing = is_audio && self.audio_playing_path.as_ref() == Some(&file_absolute_path);
+                                        let is_audio_loading = is_audio && self.audio_loading_path.as_ref() == Some(&file_absolute_path);
+                                        let has_audio_error = is_audio && self.audio_error_path.as_ref() == Some(&file_absolute_path);
+
                                         // Document/Audio/Code preview (text/table/audio metadata)
                                         if let Some(content) = self.document_cache.get(&file_absolute_path) {
                                             icon_response.on_hover_ui_at_pointer(|ui| {
@@ -1700,6 +1919,15 @@ impl eframe::App for FileListerApp {
                                                     ui.label(egui::RichText::new(&file_name).strong());
                                                     let icon = if is_audio { " 🎵" } else if is_code { " 💻" } else { " 📄" };
                                                     ui.label(egui::RichText::new(icon).color(egui::Color32::GRAY));
+                                                    // Show playing, loading, or error indicator for audio
+                                                    if is_audio_playing {
+                                                        ui.label(egui::RichText::new(" ▶ Playing").color(egui::Color32::from_rgb(50, 205, 50)));
+                                                    } else if is_audio_loading {
+                                                        ui.spinner();
+                                                        ui.label(egui::RichText::new(" Loading...").color(egui::Color32::from_rgb(100, 149, 237)));
+                                                    } else if has_audio_error {
+                                                        ui.label(egui::RichText::new(" ⚠ Unsupported").color(egui::Color32::from_rgb(255, 165, 0)));
+                                                    }
                                                 });
                                                 ui.add_space(4.0);
                                                 ui.separator();
@@ -1792,9 +2020,20 @@ impl eframe::App for FileListerApp {
                                             if self.document_loading_path.as_ref() != Some(&file_absolute_path) {
                                                 self.load_document_preview(idx, ctx);
                                             }
-                                            let loading_text = if is_audio { "Loading audio metadata..." }
-                                                else if is_code { "Loading code preview..." }
-                                                else { "Loading document preview..." };
+                                            // Show appropriate loading text with audio status
+                                            let loading_text = if is_audio {
+                                                if self.audio_playing_path.as_ref() == Some(&file_absolute_path) {
+                                                    "🎵 ▶ Playing... (loading metadata)"
+                                                } else if self.audio_error_path.as_ref() == Some(&file_absolute_path) {
+                                                    "🎵 ⚠ Unsupported format"
+                                                } else {
+                                                    "🎵 Loading & playing..."
+                                                }
+                                            } else if is_code {
+                                                "Loading code preview..."
+                                            } else {
+                                                "Loading document preview..."
+                                            };
                                             icon_response.on_hover_text(loading_text);
                                             ctx.request_repaint();
                                         }
@@ -1911,6 +2150,42 @@ impl eframe::App for FileListerApp {
                                         let is_code = Self::is_code_file(&file_extension);
 
                                         if is_document || is_audio || is_code {
+                                            // Start audio playback immediately when hovering on audio file (name column)
+                                            if is_audio {
+                                                self.audio_hover_active = true;
+                                                // Try to get duration from cache, otherwise play without seeking
+                                                let duration_secs = self.document_cache.get(&file_absolute_path)
+                                                    .and_then(|content| {
+                                                        if let DocumentPreviewContent::Audio { duration, .. } = content {
+                                                            duration.as_ref().and_then(|d| {
+                                                                let parts: Vec<&str> = d.split(':').collect();
+                                                                match parts.len() {
+                                                                    2 => {
+                                                                        let mins: f64 = parts[0].parse().ok()?;
+                                                                        let secs: f64 = parts[1].parse().ok()?;
+                                                                        Some(mins * 60.0 + secs)
+                                                                    }
+                                                                    3 => {
+                                                                        let hrs: f64 = parts[0].parse().ok()?;
+                                                                        let mins: f64 = parts[1].parse().ok()?;
+                                                                        let secs: f64 = parts[2].parse().ok()?;
+                                                                        Some(hrs * 3600.0 + mins * 60.0 + secs)
+                                                                    }
+                                                                    _ => None,
+                                                                }
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }
+                                                    });
+                                                // Start background audio loading (non-blocking)
+                                                self.load_audio_in_background(&file_absolute_path, duration_secs);
+                                            }
+                                            // Check if this audio file is currently playing, loading, or has error
+                                            let is_audio_playing = is_audio && self.audio_playing_path.as_ref() == Some(&file_absolute_path);
+                                            let is_audio_loading = is_audio && self.audio_loading_path.as_ref() == Some(&file_absolute_path);
+                                            let has_audio_error = is_audio && self.audio_error_path.as_ref() == Some(&file_absolute_path);
+
                                             // Document/Audio/Code preview (text/table/audio metadata)
                                             if let Some(content) = self.document_cache.get(&file_absolute_path) {
                                                 label.clone().on_hover_ui_at_pointer(|ui| {
@@ -1920,6 +2195,15 @@ impl eframe::App for FileListerApp {
                                                         ui.label(egui::RichText::new(&file_name).strong());
                                                         let icon = if is_audio { " 🎵" } else if is_code { " 💻" } else { " 📄" };
                                                         ui.label(egui::RichText::new(icon).color(egui::Color32::GRAY));
+                                                        // Show playing, loading, or error indicator for audio
+                                                        if is_audio_playing {
+                                                            ui.label(egui::RichText::new(" ▶ Playing").color(egui::Color32::from_rgb(50, 205, 50)));
+                                                        } else if is_audio_loading {
+                                                            ui.spinner();
+                                                            ui.label(egui::RichText::new(" Loading...").color(egui::Color32::from_rgb(100, 149, 237)));
+                                                        } else if has_audio_error {
+                                                            ui.label(egui::RichText::new(" ⚠ Unsupported").color(egui::Color32::from_rgb(255, 165, 0)));
+                                                        }
                                                     });
                                                     ui.add_space(4.0);
                                                     ui.separator();
@@ -2012,9 +2296,20 @@ impl eframe::App for FileListerApp {
                                                 if self.document_loading_path.as_ref() != Some(&file_absolute_path) {
                                                     self.load_document_preview(idx, ctx);
                                                 }
-                                                let loading_text = if is_audio { "Loading audio metadata..." }
-                                                    else if is_code { "Loading code preview..." }
-                                                    else { "Loading document preview..." };
+                                                // Show appropriate loading text with audio status
+                                                let loading_text = if is_audio {
+                                                    if self.audio_playing_path.as_ref() == Some(&file_absolute_path) {
+                                                        "🎵 ▶ Playing... (loading metadata)"
+                                                    } else if self.audio_error_path.as_ref() == Some(&file_absolute_path) {
+                                                        "🎵 ⚠ Unsupported format"
+                                                    } else {
+                                                        "🎵 Loading & playing..."
+                                                    }
+                                                } else if is_code {
+                                                    "Loading code preview..."
+                                                } else {
+                                                    "Loading document preview..."
+                                                };
                                                 label.clone().on_hover_text(loading_text);
                                                 ctx.request_repaint();
                                             }
@@ -2361,6 +2656,11 @@ impl eframe::App for FileListerApp {
                         ui.add_space(20.0);
                     });
                 });
+        }
+
+        // Stop audio playback if not hovering over any audio file this frame
+        if !self.audio_hover_active && self.audio_playing_path.is_some() {
+            self.stop_audio_preview();
         }
     }
 }
