@@ -6,10 +6,14 @@ A desktop application built with Rust that lists files from a selected folder an
 
 ## Functional Requirements
 
-### FR-01: Folder Selection
-- **FR-01.1**: User can select a folder via native file dialog (GUI mode)
-- **FR-01.2**: User can specify folder path via command-line argument (CLI mode)
-- **FR-01.3**: Display selected folder path in the UI
+### FR-01: Folder Selection (Multiple Folder Support)
+- **FR-01.1**: User can select multiple folders via native file dialog (GUI mode)
+- **FR-01.2**: User can specify folder path via command-line argument (CLI mode - single folder)
+- **FR-01.3**: Display list of selected folders in the UI
+- **FR-01.4**: "Add Folder..." button to add folders to the selection
+- **FR-01.5**: Remove button (x) next to each folder to remove from selection
+- **FR-01.6**: Files from multiple folders are combined in a single list
+- **FR-01.7**: Relative paths prefixed with folder name: `[FolderName]/path/to/file`
 
 ### FR-02: File Scanning
 - **FR-02.1**: Scan all files in the selected folder
@@ -165,6 +169,20 @@ A desktop application built with Rust that lists files from a selected folder an
 - **FR-19.5**: Automatic extraction to user's local data directory
 - **FR-19.6**: Button hidden once dependency is available
 
+### FR-20: Document Hover Preview
+- **FR-20.1**: Hover preview for document files (like images/videos/PDFs)
+- **FR-20.2**: Supported document types:
+  - **DOCX**: Extract and display text content (first 50 lines)
+  - **DOC**: Legacy format - shows message suggesting conversion to DOCX
+  - **XLSX/XLS**: Display first sheet as table preview (headers + first 10 rows, 5 columns)
+  - **CSV**: Display as table preview (headers + first 10 rows, 5 columns)
+  - **TXT**: Display plain text content (first 50 lines)
+- **FR-20.3**: Background loading with "Loading document preview..." indicator
+- **FR-20.4**: Scrollable hover tooltip for large content
+- **FR-20.5**: 📄 icon indicator for document files
+- **FR-20.6**: Monospace font for text content
+- **FR-20.7**: Document content cached for faster subsequent hovers
+
 ## Non-Functional Requirements
 
 ### NFR-01: Unicode Support
@@ -209,11 +227,12 @@ A desktop application built with Rust that lists files from a selected folder an
 | GUI Framework | eframe/egui | 0.33 |
 | Table Component | egui_extras | 0.33 |
 | File Dialog | rfd | 0.15 |
-| CSV Writing | csv | 1.4 |
+| CSV Writing/Reading | csv | 1.4 |
 | Serialization | serde | 1.0 |
 | CLI Parsing | clap | 4.5 |
 | Image Processing | image | 0.25 |
 | PDF Rendering | pdfium-render | 0.8 |
+| XLSX Reading | calamine | 0.26 |
 | HTTP Client | ureq | 2.9 |
 | ZIP Extraction | zip | 0.6 |
 | TGZ Extraction | flate2 + tar | 1.0 / 0.4 |
@@ -227,10 +246,22 @@ struct FileInfo {
     name: String,              // File name without extension
     extension: String,         // File extension
     full_name: String,         // Complete file name
-    relative_path: String,     // Path relative to selected folder
+    relative_path: String,     // Path relative to selected folder (with folder prefix for multi-folder)
     absolute_path: String,     // Full absolute path
     file_size: u64,            // Size in bytes
     modified_timestamp: i64,   // Unix timestamp of last modification
+    source_folder: String,     // Source folder name (for multi-folder scanning)
+}
+
+enum DocumentPreviewContent {
+    Text(String),              // Plain text content (txt, docx)
+    Table {                    // Table data (xlsx, csv)
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        sheet_name: Option<String>,
+    },
+    Loading,                   // Loading state
+    Error(String),             // Error state
 }
 ```
 
@@ -238,18 +269,21 @@ struct FileInfo {
 
 ```
 src/
-├── main.rs           # Entry point, CLI parsing
-├── app.rs            # GUI application logic
-├── file_scanner.rs   # File system operations
-├── csv_export.rs     # CSV writing
-└── lib.rs            # Module declarations
+├── main.rs            # Entry point, CLI parsing
+├── app.rs             # GUI application logic
+├── file_scanner.rs    # File system operations
+├── csv_export.rs      # CSV writing
+├── document_parser.rs # Document parsing (docx, xlsx, csv, txt)
+└── lib.rs             # Module declarations
 ```
 
 ## User Interface Layout
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ [Select Folder...] Selected: C:\path\to\folder                              │
+│ [Add Folder...] 2 folder(s) selected                                        │
+│   [x] C:\path\to\folder1                                                    │
+│   [x] C:\path\to\folder2                                                    │
 │ ☐ Include subfolders (recursive)  [Scanning spinner...]                     │
 │ Scanned: 150 files found                                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -280,8 +314,6 @@ Hover Preview:
 ## Future Enhancements (Out of Scope)
 
 - [ ] Search within file contents
-- [ ] File preview panel (full preview, not just hover)
-- [ ] Multiple folder selection
 - [ ] Export to JSON/Excel formats
 - [ ] Drag and drop folder
 - [ ] Remember last folder location
@@ -293,3 +325,5 @@ Hover Preview:
 - [x] ~~Image hover preview~~ (Implemented in FR-16)
 - [x] ~~Video hover preview~~ (Implemented in FR-17)
 - [x] ~~PDF hover preview~~ (Implemented in FR-18)
+- [x] ~~Multiple folder selection~~ (Implemented in FR-01)
+- [x] ~~Document preview modal~~ (Implemented in FR-20)

@@ -13,11 +13,12 @@ A Rust desktop application to list files from a folder and export to CSV.
 
 ```
 src/
-├── main.rs           # Entry point, CLI parsing, GUI/CLI mode switching
-├── app.rs            # GUI application (egui), sorting, filtering, context menu
-├── file_scanner.rs   # File system scanning, FileInfo struct
-├── csv_export.rs     # CSV export with UTF-8 BOM
-└── lib.rs            # Module declarations
+├── main.rs            # Entry point, CLI parsing, GUI/CLI mode switching
+├── app.rs             # GUI application (egui), sorting, filtering, context menu
+├── file_scanner.rs    # File system scanning, FileInfo struct
+├── csv_export.rs      # CSV export with UTF-8 BOM
+├── document_parser.rs # Document parsing (docx, xlsx, csv, txt preview)
+└── lib.rs             # Module declarations
 ```
 
 ## Key Data Structure
@@ -27,9 +28,11 @@ struct FileInfo {
     name: String,           // File name without extension
     extension: String,      // File extension
     full_name: String,      // Complete file name
-    relative_path: String,  // Path relative to selected folder
+    relative_path: String,  // Path relative to selected folder (with [FolderName]/ prefix for multi-folder)
     absolute_path: String,  // Full absolute path
     file_size: u64,         // Size in bytes
+    modified_timestamp: i64, // Unix timestamp
+    source_folder: String,  // Source folder name (for multi-folder scanning)
 }
 ```
 
@@ -58,6 +61,8 @@ struct FileInfo {
 - [x] Image hover preview (tooltip popup)
 - [x] Video hover preview (FFmpeg thumbnail extraction)
 - [x] PDF hover preview (first page, requires Pdfium)
+- [x] Multiple folder selection (add/remove folders)
+- [x] Document hover preview (docx, xlsx, csv, txt)
 
 ## Documentation
 

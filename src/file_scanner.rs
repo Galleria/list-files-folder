@@ -13,6 +13,9 @@ pub struct FileInfo {
     pub file_size: u64,
     /// Modification timestamp (seconds since UNIX epoch)
     pub modified_timestamp: i64,
+    /// Source folder name (for multi-folder scanning)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source_folder: String,
 }
 
 /// Check if a timestamp (seconds since UNIX epoch) is from today
@@ -176,6 +179,7 @@ fn scan_folder_internal(
                 absolute_path,
                 file_size,
                 modified_timestamp,
+                source_folder: String::new(),
             });
         } else if path.is_dir() && recursive {
             // Recursively scan subdirectories
@@ -184,4 +188,41 @@ fn scan_folder_internal(
     }
 
     Ok(())
+}
+
+/// Scan multiple folders and return combined results
+/// Each file's relative_path will be prefixed with the folder name to distinguish source
+pub fn scan_folders(paths: &[std::path::PathBuf], recursive: bool) -> Result<Vec<FileInfo>, std::io::Error> {
+    let mut all_files = Vec::new();
+
+    for path in paths {
+        if !path.is_dir() {
+            continue; // Skip non-directories
+        }
+
+        let folder_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        let mut folder_files = Vec::new();
+        scan_folder_internal(path, path, recursive, &mut folder_files)?;
+
+        // Prefix relative_path with folder name and set source_folder
+        for file in &mut folder_files {
+            file.relative_path = format!("[{}]/{}", folder_name, file.relative_path);
+            file.source_folder = folder_name.clone();
+        }
+
+        all_files.extend(folder_files);
+    }
+
+    // Sort alphabetically by relative path
+    all_files.sort_by(|a, b| {
+        a.relative_path
+            .to_lowercase()
+            .cmp(&b.relative_path.to_lowercase())
+    });
+
+    Ok(all_files)
 }

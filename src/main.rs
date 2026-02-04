@@ -2,6 +2,7 @@
 
 mod app;
 mod csv_export;
+mod document_parser;
 mod file_scanner;
 
 use clap::Parser;

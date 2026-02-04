@@ -1,4 +1,5 @@
 use crate::csv_export;
+use crate::document_parser;
 use crate::file_scanner::{self, format_date, format_size, is_today, FileInfo};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -43,8 +44,36 @@ pub enum SortOrder {
     Descending,
 }
 
+/// Content type for document preview
+#[derive(Clone)]
+pub enum DocumentPreviewContent {
+    /// Plain text content (for txt, docx)
+    Text(String),
+    /// Code content with syntax highlighting info
+    Code { content: String, language: String },
+    /// Table data: headers + rows (for xlsx, csv)
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        sheet_name: Option<String>,
+    },
+    /// Audio metadata
+    Audio {
+        duration: Option<String>,
+        sample_rate: Option<u32>,
+        channels: Option<u8>,
+        codec: Option<String>,
+        bitrate: Option<u32>,
+    },
+    /// Loading state
+    Loading,
+    /// Error state
+    Error(String),
+}
+
 pub struct FileListerApp {
-    selected_folder: Option<PathBuf>,
+    /// Selected folders for scanning (multiple folder support)
+    selected_folders: Vec<PathBuf>,
     files: Vec<FileInfo>,
     filtered_files: Vec<FileInfo>,
     status_message: String,
@@ -83,12 +112,18 @@ pub struct FileListerApp {
     image_loading_path: Option<String>,
     /// When the current image/video loading started (for timeout)
     image_loading_start: Option<Instant>,
+    /// Cache of loaded document content (absolute_path -> content)
+    document_cache: HashMap<String, DocumentPreviewContent>,
+    /// Receiver for background document loading
+    document_receiver: Option<Receiver<(String, DocumentPreviewContent)>>,
+    /// Path currently being loaded for document preview
+    document_loading_path: Option<String>,
 }
 
 impl Default for FileListerApp {
     fn default() -> Self {
         Self {
-            selected_folder: None,
+            selected_folders: Vec::new(),
             files: Vec::new(),
             filtered_files: Vec::new(),
             status_message: String::from("Select a folder to scan"),
@@ -112,6 +147,9 @@ impl Default for FileListerApp {
             image_receiver: None,
             image_loading_path: None,
             image_loading_start: None,
+            document_cache: HashMap::new(),
+            document_receiver: None,
+            document_loading_path: None,
         }
     }
 }
@@ -182,28 +220,34 @@ impl FileListerApp {
         Self::default()
     }
 
-    fn scan_selected_folder(&mut self) {
+    fn scan_all_folders(&mut self) {
         self.error_message = None;
         self.selected_files.clear(); // Clear selections on rescan
         self.image_cache.clear(); // Clear image cache on rescan
+        self.document_cache.clear(); // Clear document cache on rescan
 
-        if let Some(folder) = &self.selected_folder {
-            let folder = folder.clone();
-            let recursive = self.recursive;
-
-            // Create channel for receiving results
-            let (tx, rx) = mpsc::channel();
-            self.scan_receiver = Some(rx);
-            self.is_scanning = true;
-            self.status_message = String::from("Scanning...");
-
-            // Spawn background thread for scanning
-            thread::spawn(move || {
-                let result = file_scanner::scan_folder(&folder, recursive)
-                    .map_err(|e| e.to_string());
-                let _ = tx.send(result);
-            });
+        if self.selected_folders.is_empty() {
+            self.files.clear();
+            self.filtered_files.clear();
+            self.status_message = String::from("Select a folder to scan");
+            return;
         }
+
+        let folders = self.selected_folders.clone();
+        let recursive = self.recursive;
+
+        // Create channel for receiving results
+        let (tx, rx) = mpsc::channel();
+        self.scan_receiver = Some(rx);
+        self.is_scanning = true;
+        self.status_message = String::from("Scanning...");
+
+        // Spawn background thread for scanning
+        thread::spawn(move || {
+            let result = file_scanner::scan_folders(&folders, recursive)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
     }
 
     /// Check for scan results from background thread
@@ -483,7 +527,7 @@ impl FileListerApp {
                 self.status_message = format!("Deleted: {}", path.file_name().unwrap_or_default().to_string_lossy());
                 self.error_message = None;
                 // Re-scan to update the list
-                self.scan_selected_folder();
+                self.scan_all_folders();
             }
             Err(e) => {
                 self.error_message = Some(format!("Delete failed: {}", e));
@@ -503,7 +547,7 @@ impl FileListerApp {
                     Ok(_) => {
                         self.status_message = format!("Moved: {} → {}", file_name.to_string_lossy(), dest_folder.display());
                         self.error_message = None;
-                        self.scan_selected_folder();
+                        self.scan_all_folders();
                     }
                     Err(_) => {
                         // If rename fails (cross-device), try copy + delete
@@ -511,11 +555,11 @@ impl FileListerApp {
                             self.error_message = Some(format!("Move failed: {}", copy_err));
                         } else if let Err(del_err) = std::fs::remove_file(source) {
                             self.error_message = Some(format!("Move partial: copied but failed to delete source: {}", del_err));
-                            self.scan_selected_folder();
+                            self.scan_all_folders();
                         } else {
                             self.status_message = format!("Moved: {} → {}", file_name.to_string_lossy(), dest_folder.display());
                             self.error_message = None;
-                            self.scan_selected_folder();
+                            self.scan_all_folders();
                         }
                     }
                 }
@@ -574,7 +618,7 @@ impl FileListerApp {
             }
 
             self.selected_files.clear();
-            self.scan_selected_folder();
+            self.scan_all_folders();
         }
     }
 
@@ -587,7 +631,7 @@ impl FileListerApp {
                     self.status_message = format!("Renamed to: {}", new_name);
                     self.error_message = None;
                     // Re-scan to update the list
-                    self.scan_selected_folder();
+                    self.scan_all_folders();
                 }
                 Err(e) => {
                     self.error_message = Some(format!("Rename failed: {}", e));
@@ -685,7 +729,7 @@ impl FileListerApp {
         self.pending_delete_paths.clear();
         self.show_delete_confirm = false;
         self.selected_files.clear();
-        self.scan_selected_folder();
+        self.scan_all_folders();
     }
 
     fn cancel_bulk_delete(&mut self) {
@@ -710,9 +754,155 @@ impl FileListerApp {
         extension.to_lowercase() == "pdf"
     }
 
-    /// Check if file is previewable (image, video, or PDF)
+    /// Check if file extension is an audio type
+    fn is_audio_file(extension: &str) -> bool {
+        let audio_extensions = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "wma", "opus"];
+        audio_extensions.contains(&extension.to_lowercase().as_str())
+    }
+
+    /// Check if file extension is a code/source file
+    fn is_code_file(extension: &str) -> bool {
+        let code_extensions = [
+            "html", "htm", "js", "jsx", "ts", "tsx", "css", "scss", "less",
+            "xml", "yaml", "yml", "json", "toml", "ini", "conf", "cfg",
+            "rs", "py", "rb", "go", "java", "c", "cpp", "h", "hpp",
+            "sh", "bash", "zsh", "bat", "ps1", "sql", "md", "markdown",
+        ];
+        code_extensions.contains(&extension.to_lowercase().as_str())
+    }
+
+    /// Check if file is previewable (image, video, PDF, document, audio, or code)
     fn is_previewable(extension: &str) -> bool {
-        Self::is_image_file(extension) || Self::is_video_file(extension) || Self::is_pdf_file(extension)
+        Self::is_image_file(extension)
+            || Self::is_video_file(extension)
+            || Self::is_pdf_file(extension)
+            || Self::is_document_file(extension)
+            || Self::is_audio_file(extension)
+            || Self::is_code_file(extension)
+    }
+
+    /// Check if file is a document that can be previewed
+    fn is_document_file(extension: &str) -> bool {
+        matches!(
+            extension.to_lowercase().as_str(),
+            "docx" | "doc" | "xlsx" | "xls" | "csv" | "txt"
+        )
+    }
+
+    /// Load document preview in background for hover
+    fn load_document_preview(&mut self, idx: usize, ctx: &egui::Context) {
+        if idx >= self.filtered_files.len() {
+            return;
+        }
+
+        let file = &self.filtered_files[idx];
+        let abs_path = file.absolute_path.clone();
+        let extension = file.extension.to_lowercase();
+
+        // Already in cache - nothing to do
+        if self.document_cache.contains_key(&abs_path) {
+            return;
+        }
+
+        // Don't start new load if we're already loading this file
+        if self.document_loading_path.as_ref() == Some(&abs_path) {
+            return;
+        }
+
+        // Start background loading
+        let (tx, rx) = mpsc::channel();
+        self.document_receiver = Some(rx);
+        self.document_loading_path = Some(abs_path.clone());
+
+        thread::spawn(move || {
+            let path = std::path::Path::new(&abs_path);
+            let ext = extension.as_str();
+
+            // Check if it's an audio file
+            let audio_extensions = ["mp3", "wav", "ogg", "flac", "aac", "m4a", "wma", "opus"];
+            let is_audio = audio_extensions.contains(&ext);
+
+            // Check if it's a code file
+            let code_extensions = [
+                "html", "htm", "js", "jsx", "ts", "tsx", "css", "scss", "less",
+                "xml", "yaml", "yml", "json", "toml", "ini", "conf", "cfg",
+                "rs", "py", "rb", "go", "java", "c", "cpp", "h", "hpp",
+                "sh", "bash", "zsh", "bat", "ps1", "sql", "md", "markdown",
+            ];
+            let is_code = code_extensions.contains(&ext);
+
+            let content = if is_audio {
+                // Audio metadata extraction
+                match document_parser::extract_audio_metadata(path) {
+                    Ok(meta) => DocumentPreviewContent::Audio {
+                        duration: meta.duration_secs.map(document_parser::format_duration),
+                        sample_rate: meta.sample_rate,
+                        channels: meta.channels,
+                        codec: meta.codec,
+                        bitrate: meta.bitrate,
+                    },
+                    Err(e) => DocumentPreviewContent::Error(e),
+                }
+            } else if is_code {
+                // Code file preview
+                match document_parser::extract_code_text(path) {
+                    Ok(text) => DocumentPreviewContent::Code {
+                        content: text,
+                        language: ext.to_string(),
+                    },
+                    Err(e) => DocumentPreviewContent::Error(e),
+                }
+            } else {
+                // Document files
+                match ext {
+                    "docx" => match document_parser::extract_docx_text(path) {
+                        Ok(text) => DocumentPreviewContent::Text(text),
+                        Err(e) => DocumentPreviewContent::Error(e),
+                    },
+                    "doc" => DocumentPreviewContent::Error(
+                        "Legacy .doc format not supported.\nPlease convert to .docx for preview."
+                            .to_string(),
+                    ),
+                    "txt" => match document_parser::extract_txt_text(path) {
+                        Ok(text) => DocumentPreviewContent::Text(text),
+                        Err(e) => DocumentPreviewContent::Error(e),
+                    },
+                    "xlsx" | "xls" => match document_parser::extract_xlsx_table(path) {
+                        Ok((headers, rows, sheet_name)) => DocumentPreviewContent::Table {
+                            headers,
+                            rows,
+                            sheet_name,
+                        },
+                        Err(e) => DocumentPreviewContent::Error(e),
+                    },
+                    "csv" => match document_parser::extract_csv_table(path) {
+                        Ok((headers, rows)) => DocumentPreviewContent::Table {
+                            headers,
+                            rows,
+                            sheet_name: None,
+                        },
+                        Err(e) => DocumentPreviewContent::Error(e),
+                    },
+                    _ => DocumentPreviewContent::Error("Unsupported file type".to_string()),
+                }
+            };
+
+            let _ = tx.send((abs_path, content));
+        });
+
+        ctx.request_repaint();
+    }
+
+    /// Check for completed background document loads
+    fn check_document_loads(&mut self) {
+        if let Some(receiver) = &self.document_receiver {
+            if let Ok((path, content)) = receiver.try_recv() {
+                // Store in cache
+                self.document_cache.insert(path.clone(), content);
+                self.document_loading_path = None;
+                self.document_receiver = None;
+            }
+        }
     }
 
     /// Load hover preview for image/video file in background
@@ -1168,8 +1358,11 @@ impl eframe::App for FileListerApp {
         // Check for background image load results
         self.check_image_loads(ctx);
 
-        // Keep repainting while scanning or loading images
-        if self.is_scanning || self.image_receiver.is_some() {
+        // Check for background document load results
+        self.check_document_loads();
+
+        // Keep repainting while scanning or loading images/documents
+        if self.is_scanning || self.image_receiver.is_some() || self.document_receiver.is_some() {
             ctx.request_repaint();
         }
 
@@ -1184,18 +1377,50 @@ impl eframe::App for FileListerApp {
             // Folder selection section
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.is_scanning, |ui| {
-                    if ui.button("Select Folder...").clicked() {
+                    if ui.button("Add Folder...").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.selected_folder = Some(folder);
-                            self.scan_selected_folder();
+                            // Avoid adding duplicate folders
+                            if !self.selected_folders.contains(&folder) {
+                                self.selected_folders.push(folder);
+                                self.scan_all_folders();
+                            }
                         }
                     }
                 });
 
-                if let Some(folder) = &self.selected_folder {
-                    ui.label(format!("Selected: {}", folder.display()));
+                ui.label(format!("{} folder(s) selected", self.selected_folders.len()));
+
+                // Show loading spinner while scanning
+                if self.is_scanning {
+                    ui.spinner();
+                    ui.label("Scanning files...");
                 }
             });
+
+            // Display selected folders list with remove buttons
+            if !self.selected_folders.is_empty() {
+                ui.add_space(3.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("folder_list")
+                    .max_height(60.0)
+                    .show(ui, |ui| {
+                        let mut folder_to_remove: Option<usize> = None;
+                        for (idx, folder) in self.selected_folders.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(!self.is_scanning, |ui| {
+                                    if ui.small_button("x").clicked() {
+                                        folder_to_remove = Some(idx);
+                                    }
+                                });
+                                ui.label(folder.display().to_string());
+                            });
+                        }
+                        if let Some(idx) = folder_to_remove {
+                            self.selected_folders.remove(idx);
+                            self.scan_all_folders();
+                        }
+                    });
+            }
 
             ui.add_space(5.0);
 
@@ -1205,17 +1430,11 @@ impl eframe::App for FileListerApp {
                     let old_recursive = self.recursive;
                     ui.checkbox(&mut self.recursive, "Include subfolders (recursive)");
 
-                    // Re-scan if checkbox changed and folder is selected
-                    if old_recursive != self.recursive && self.selected_folder.is_some() {
-                        self.scan_selected_folder();
+                    // Re-scan if checkbox changed and folders are selected
+                    if old_recursive != self.recursive && !self.selected_folders.is_empty() {
+                        self.scan_all_folders();
                     }
                 });
-
-                // Show loading spinner while scanning
-                if self.is_scanning {
-                    ui.spinner();
-                    ui.label("Scanning files...");
-                }
             });
 
             ui.add_space(5.0);
@@ -1463,13 +1682,124 @@ impl eframe::App for FileListerApp {
                                     icon_label
                                 }).inner;
 
-                                // Show preview on hover for image/video/PDF files (on icon)
+                                // Show preview on hover for previewable files (on icon)
                                 if icon_response.hovered() && Self::is_previewable(&file_extension) {
                                     let is_video = Self::is_video_file(&file_extension);
                                     let is_pdf = Self::is_pdf_file(&file_extension);
-                                    // Get cached texture or trigger background load
-                                    if let Some(tex) = self.image_cache.get(&file_absolute_path) {
-                                        // Show from cache immediately
+                                    let is_document = Self::is_document_file(&file_extension);
+                                    let is_audio = Self::is_audio_file(&file_extension);
+                                    let is_code = Self::is_code_file(&file_extension);
+
+                                    if is_document || is_audio || is_code {
+                                        // Document/Audio/Code preview (text/table/audio metadata)
+                                        if let Some(content) = self.document_cache.get(&file_absolute_path) {
+                                            icon_response.on_hover_ui_at_pointer(|ui| {
+                                                ui.set_max_width(if is_code { 600.0 } else { 500.0 });
+                                                ui.set_max_height(if is_code { 500.0 } else { 400.0 });
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new(&file_name).strong());
+                                                    let icon = if is_audio { " 🎵" } else if is_code { " 💻" } else { " 📄" };
+                                                    ui.label(egui::RichText::new(icon).color(egui::Color32::GRAY));
+                                                });
+                                                ui.add_space(4.0);
+                                                ui.separator();
+                                                egui::ScrollArea::vertical()
+                                                    .max_height(if is_code { 450.0 } else { 350.0 })
+                                                    .show(ui, |ui| {
+                                                        match content {
+                                                            DocumentPreviewContent::Text(text) => {
+                                                                ui.add(egui::Label::new(
+                                                                    egui::RichText::new(text).monospace().size(11.0)
+                                                                ).wrap());
+                                                            }
+                                                            DocumentPreviewContent::Code { content, language } => {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(egui::RichText::new(format!("Language: {}", language.to_uppercase())).small().color(egui::Color32::GRAY));
+                                                                });
+                                                                ui.add_space(4.0);
+                                                                ui.add(egui::Label::new(
+                                                                    egui::RichText::new(content).monospace().size(10.0)
+                                                                ).wrap());
+                                                            }
+                                                            DocumentPreviewContent::Audio { duration, sample_rate, channels, codec, bitrate } => {
+                                                                egui::Grid::new("audio_metadata")
+                                                                    .num_columns(2)
+                                                                    .spacing([10.0, 4.0])
+                                                                    .show(ui, |ui| {
+                                                                        if let Some(d) = duration {
+                                                                            ui.label(egui::RichText::new("Duration:").strong());
+                                                                            ui.label(d);
+                                                                            ui.end_row();
+                                                                        }
+                                                                        if let Some(c) = codec {
+                                                                            ui.label(egui::RichText::new("Codec:").strong());
+                                                                            ui.label(c);
+                                                                            ui.end_row();
+                                                                        }
+                                                                        if let Some(sr) = sample_rate {
+                                                                            ui.label(egui::RichText::new("Sample Rate:").strong());
+                                                                            ui.label(format!("{} Hz", sr));
+                                                                            ui.end_row();
+                                                                        }
+                                                                        if let Some(ch) = channels {
+                                                                            ui.label(egui::RichText::new("Channels:").strong());
+                                                                            ui.label(format!("{}", ch));
+                                                                            ui.end_row();
+                                                                        }
+                                                                        if let Some(br) = bitrate {
+                                                                            ui.label(egui::RichText::new("Bitrate:").strong());
+                                                                            ui.label(format!("{} kbps", br / 1000));
+                                                                            ui.end_row();
+                                                                        }
+                                                                    });
+                                                            }
+                                                            DocumentPreviewContent::Table { headers, rows, sheet_name } => {
+                                                                if let Some(name) = sheet_name {
+                                                                    ui.label(format!("Sheet: {}", name));
+                                                                }
+                                                                // Simple table display for hover
+                                                                let header_text = headers.iter()
+                                                                    .take(5)
+                                                                    .map(|h| h.as_str())
+                                                                    .collect::<Vec<_>>()
+                                                                    .join(" | ");
+                                                                ui.label(egui::RichText::new(header_text).strong().monospace().size(10.0));
+                                                                ui.separator();
+                                                                for row in rows.iter().take(10) {
+                                                                    let row_text = row.iter()
+                                                                        .take(5)
+                                                                        .map(|c| c.as_str())
+                                                                        .collect::<Vec<_>>()
+                                                                        .join(" | ");
+                                                                    ui.label(egui::RichText::new(row_text).monospace().size(10.0));
+                                                                }
+                                                                if rows.len() > 10 {
+                                                                    ui.label(format!("... and {} more rows", rows.len() - 10));
+                                                                }
+                                                            }
+                                                            DocumentPreviewContent::Error(err) => {
+                                                                ui.colored_label(egui::Color32::RED, err);
+                                                            }
+                                                            DocumentPreviewContent::Loading => {
+                                                                ui.spinner();
+                                                                ui.label("Loading...");
+                                                            }
+                                                        }
+                                                    });
+                                            });
+                                        } else {
+                                            // Start loading document/audio/code in background
+                                            if self.document_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                self.load_document_preview(idx, ctx);
+                                            }
+                                            let loading_text = if is_audio { "Loading audio metadata..." }
+                                                else if is_code { "Loading code preview..." }
+                                                else { "Loading document preview..." };
+                                            icon_response.on_hover_text(loading_text);
+                                            ctx.request_repaint();
+                                        }
+                                    } else if let Some(tex) = self.image_cache.get(&file_absolute_path) {
+                                        // Show image/video/PDF from cache
                                         icon_response.on_hover_ui_at_pointer(|ui| {
                                             ui.set_max_width(420.0);
                                             ui.horizontal(|ui| {
@@ -1572,13 +1902,124 @@ impl eframe::App for FileListerApp {
                                         self.start_rename(idx);
                                     }
 
-                                    // Show preview on hover for image/video/PDF files
+                                    // Show preview on hover for previewable files
                                     if label.hovered() && Self::is_previewable(&file_extension) {
                                         let is_video = Self::is_video_file(&file_extension);
                                         let is_pdf = Self::is_pdf_file(&file_extension);
-                                        // Get cached texture or trigger background load
-                                        if let Some(tex) = self.image_cache.get(&file_absolute_path) {
-                                            // Show from cache immediately
+                                        let is_document = Self::is_document_file(&file_extension);
+                                        let is_audio = Self::is_audio_file(&file_extension);
+                                        let is_code = Self::is_code_file(&file_extension);
+
+                                        if is_document || is_audio || is_code {
+                                            // Document/Audio/Code preview (text/table/audio metadata)
+                                            if let Some(content) = self.document_cache.get(&file_absolute_path) {
+                                                label.clone().on_hover_ui_at_pointer(|ui| {
+                                                    ui.set_max_width(if is_code { 600.0 } else { 500.0 });
+                                                    ui.set_max_height(if is_code { 500.0 } else { 400.0 });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(egui::RichText::new(&file_name).strong());
+                                                        let icon = if is_audio { " 🎵" } else if is_code { " 💻" } else { " 📄" };
+                                                        ui.label(egui::RichText::new(icon).color(egui::Color32::GRAY));
+                                                    });
+                                                    ui.add_space(4.0);
+                                                    ui.separator();
+                                                    egui::ScrollArea::vertical()
+                                                        .max_height(if is_code { 450.0 } else { 350.0 })
+                                                        .show(ui, |ui| {
+                                                            match content {
+                                                                DocumentPreviewContent::Text(text) => {
+                                                                    ui.add(egui::Label::new(
+                                                                        egui::RichText::new(text).monospace().size(11.0)
+                                                                    ).wrap());
+                                                                }
+                                                                DocumentPreviewContent::Code { content, language } => {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.label(egui::RichText::new(format!("Language: {}", language.to_uppercase())).small().color(egui::Color32::GRAY));
+                                                                    });
+                                                                    ui.add_space(4.0);
+                                                                    ui.add(egui::Label::new(
+                                                                        egui::RichText::new(content).monospace().size(10.0)
+                                                                    ).wrap());
+                                                                }
+                                                                DocumentPreviewContent::Audio { duration, sample_rate, channels, codec, bitrate } => {
+                                                                    egui::Grid::new("audio_metadata_name")
+                                                                        .num_columns(2)
+                                                                        .spacing([10.0, 4.0])
+                                                                        .show(ui, |ui| {
+                                                                            if let Some(d) = duration {
+                                                                                ui.label(egui::RichText::new("Duration:").strong());
+                                                                                ui.label(d);
+                                                                                ui.end_row();
+                                                                            }
+                                                                            if let Some(c) = codec {
+                                                                                ui.label(egui::RichText::new("Codec:").strong());
+                                                                                ui.label(c);
+                                                                                ui.end_row();
+                                                                            }
+                                                                            if let Some(sr) = sample_rate {
+                                                                                ui.label(egui::RichText::new("Sample Rate:").strong());
+                                                                                ui.label(format!("{} Hz", sr));
+                                                                                ui.end_row();
+                                                                            }
+                                                                            if let Some(ch) = channels {
+                                                                                ui.label(egui::RichText::new("Channels:").strong());
+                                                                                ui.label(format!("{}", ch));
+                                                                                ui.end_row();
+                                                                            }
+                                                                            if let Some(br) = bitrate {
+                                                                                ui.label(egui::RichText::new("Bitrate:").strong());
+                                                                                ui.label(format!("{} kbps", br / 1000));
+                                                                                ui.end_row();
+                                                                            }
+                                                                        });
+                                                                }
+                                                                DocumentPreviewContent::Table { headers, rows, sheet_name } => {
+                                                                    if let Some(name) = sheet_name {
+                                                                        ui.label(format!("Sheet: {}", name));
+                                                                    }
+                                                                    // Simple table display for hover
+                                                                    let header_text = headers.iter()
+                                                                        .take(5)
+                                                                        .map(|h| h.as_str())
+                                                                        .collect::<Vec<_>>()
+                                                                        .join(" | ");
+                                                                    ui.label(egui::RichText::new(header_text).strong().monospace().size(10.0));
+                                                                    ui.separator();
+                                                                    for row in rows.iter().take(10) {
+                                                                        let row_text = row.iter()
+                                                                            .take(5)
+                                                                            .map(|c| c.as_str())
+                                                                            .collect::<Vec<_>>()
+                                                                            .join(" | ");
+                                                                        ui.label(egui::RichText::new(row_text).monospace().size(10.0));
+                                                                    }
+                                                                    if rows.len() > 10 {
+                                                                        ui.label(format!("... and {} more rows", rows.len() - 10));
+                                                                    }
+                                                                }
+                                                                DocumentPreviewContent::Error(err) => {
+                                                                    ui.colored_label(egui::Color32::RED, err);
+                                                                }
+                                                                DocumentPreviewContent::Loading => {
+                                                                    ui.spinner();
+                                                                    ui.label("Loading...");
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                            } else {
+                                                // Start loading document/audio/code in background
+                                                if self.document_loading_path.as_ref() != Some(&file_absolute_path) {
+                                                    self.load_document_preview(idx, ctx);
+                                                }
+                                                let loading_text = if is_audio { "Loading audio metadata..." }
+                                                    else if is_code { "Loading code preview..." }
+                                                    else { "Loading document preview..." };
+                                                label.clone().on_hover_text(loading_text);
+                                                ctx.request_repaint();
+                                            }
+                                        } else if let Some(tex) = self.image_cache.get(&file_absolute_path) {
+                                            // Show image/video/PDF from cache
                                             label.clone().on_hover_ui_at_pointer(|ui| {
                                                 ui.set_max_width(420.0);
                                                 ui.horizontal(|ui| {
